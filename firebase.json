@@ -1,0 +1,21 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "track",
+      "predeploy": [
+        "pnpm --dir functions build"
+      ],
+      "ignore": [
+        "node_modules",
+        ".git",
+        "**/*.ts",
+        "**/*.test.js",
+        "tsconfig.json",
+        "*.log",
+        ".env",
+        ".env.*"
+      ]
+    }
+  ]
+}

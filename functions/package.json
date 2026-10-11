@@ -1,0 +1,20 @@
+{
+  "name": "track-functions",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "22" },
+  "main": "lib/functions/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node --test lib/functions/test/*.test.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.4.0",
+    "firebase-functions": "^6.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3"
+  }
+}
