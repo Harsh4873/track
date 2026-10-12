@@ -8,8 +8,8 @@ type Session = { token: string; expiresAt: string };
 
 const API = (import.meta.env.VITE_TRACK_API_URL || 'https://trackapi-5ofllh7vvq-uc.a.run.app').replace(/\/$/, '');
 const root = document.querySelector<HTMLDivElement>('#app')!;
-const bookOrder = ['polymarket', 'fliff', 'rebet', 'novig', 'onyx', 'underdog'];
-const bookNames: Record<string, string> = { polymarket: 'Polymarket US', fliff: 'Fliff', rebet: 'Rebet', novig: 'Novig', onyx: 'Onyx', underdog: 'Underdog' };
+const bookOrder = ['polymarket', 'fliff', 'rebet', 'novig', 'underdog', 'underdog_streaks'];
+const bookNames: Record<string, string> = { polymarket: 'Polymarket US', fliff: 'Fliff', rebet: 'Rebet', novig: 'Novig', underdog: 'Underdog', underdog_streaks: 'Underdog Streaks' };
 let session: Session | null = null;
 let state: TrackState | null = null;
 let activeBook = 'polymarket';

@@ -1,5 +1,7 @@
-export const BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'onyx', 'underdog'] as const;
+export const BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'onyx', 'underdog', 'underdog_streaks'] as const;
+export const ACTIVE_BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'underdog', 'underdog_streaks'] as const;
 export type BookId = (typeof BOOK_IDS)[number];
+export type ActiveBookId = (typeof ACTIVE_BOOK_IDS)[number];
 export type Tier = 1 | 2 | 3;
 
 export interface Selection {
@@ -70,6 +72,7 @@ export interface BookState {
   dailyStakedCents: number;
   tickets: Ticket[];
   card: Card | null;
+  retired?: boolean;
   lastBalanceReport?: {
     reportedAt: string;
     availableCents: number;
@@ -121,6 +124,8 @@ export type LedgerEvent = EventBase & (
   | { type: 'settle'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number }
   | { type: 'adjust'; kind: 'deposit' | 'withdrawal' | 'correction'; amountCents: number; relatedEventId?: string }
   | { type: 'balance_report'; availableCents: number; previousAvailableCents: number; establishDayBaseline?: boolean }
+  | { type: 'retire_book' }
+  | { type: 'open_book'; name: string; openingCents: number; targetCents: number; policy: BookPolicy }
   | { type: 'correct_settlement'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number; relatedEventId: string }
 );
 

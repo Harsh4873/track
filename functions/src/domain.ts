@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BOOK_IDS, type BookId, type BookPolicy, type BookState, type BootstrapRequest, type Card, type ExchangeFill, type LedgerEvent, type PublishCardsRequest, type Selection, type Ticket, type TrackState } from '../../shared/types.js';
+import { ACTIVE_BOOK_IDS, BOOK_IDS, type BookId, type BookPolicy, type BookState, type BootstrapRequest, type Card, type ExchangeFill, type LedgerEvent, type PublishCardsRequest, type Selection, type Ticket, type TrackState } from '../../shared/types.js';
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string) { super(code); }
@@ -60,7 +60,7 @@ function validatePolicy(value: unknown, id: BookId): asserts value is BookPolicy
   if (value.minReturn !== null) number(value.minReturn, 1.0001, 1000);
   if (value.maxReturn !== null) number(value.maxReturn, 1.0001, 1000);
   ensure(value.minReturn === null || value.maxReturn === null || (value.minReturn as number) <= (value.maxReturn as number));
-  integer(value.minSelections); ensure(value.minSelections >= (id === 'novig' ? 1 : 2) && value.minSelections <= 12);
+  integer(value.minSelections); ensure(value.minSelections >= (['novig', 'underdog_streaks'].includes(id) ? 1 : 2) && value.minSelections <= 12);
   if (value.minLegImpliedProbability !== null) number(value.minLegImpliedProbability, 0.001, 0.999);
   if (value.maxLegImpliedProbability !== null) number(value.maxLegImpliedProbability, 0.001, 0.999);
   ensure(value.minLegImpliedProbability === null || value.maxLegImpliedProbability === null || (value.minLegImpliedProbability as number) <= (value.maxLegImpliedProbability as number));
@@ -68,13 +68,14 @@ function validatePolicy(value: unknown, id: BookId): asserts value is BookPolicy
 }
 
 export function parseBootstrap(value: unknown): BootstrapRequest {
-  object(value); key(value.idempotencyKey); timestamp(value.ledgerStart); array(value.books, 6); ensure(value.books.length === 6);
+  object(value); key(value.idempotencyKey); timestamp(value.ledgerStart); array(value.books, ACTIVE_BOOK_IDS.length); ensure(value.books.length === ACTIVE_BOOK_IDS.length);
   const ids = new Set<string>();
   for (const entry of value.books) {
     object(entry); bookId(entry.id); ensure(!ids.has(entry.id)); ids.add(entry.id);
     text(entry.name, 60); integer(entry.openingCents); integer(entry.targetCents); ensure(entry.targetCents > 0);
     validatePolicy(entry.policy, entry.id);
   }
+  ensure(ACTIVE_BOOK_IDS.every((id) => ids.has(id)) && ![...ids].some((id) => !ACTIVE_BOOK_IDS.includes(id as typeof ACTIVE_BOOK_IDS[number])), 'inactive_book');
   return value as unknown as BootstrapRequest;
 }
 
@@ -102,6 +103,12 @@ export function parseEvent(value: unknown): LedgerEvent {
     case 'balance_report':
       integer(value.availableCents); integer(value.previousAvailableCents);
       if (value.establishDayBaseline !== undefined) ensure(typeof value.establishDayBaseline === 'boolean');
+      break;
+    case 'retire_book':
+      break;
+    case 'open_book':
+      text(value.name, 60); integer(value.openingCents); integer(value.targetCents); ensure(value.targetCents > 0);
+      validatePolicy(value.policy, value.book); ensure(ACTIVE_BOOK_IDS.includes(value.book as typeof ACTIVE_BOOK_IDS[number]), 'inactive_book');
       break;
     default: throw new ApiError(400, 'invalid_event');
   }
@@ -139,7 +146,7 @@ export function bootstrap(input: BootstrapRequest, now: Date): Ledger {
   ensure(Date.parse(input.ledgerStart) <= now.getTime() + 60_000, 'future_ledger');
   return {
     ledgerStart: input.ledgerStart, updatedAt: now.toISOString(), settlementFees: {},
-    books: BOOK_IDS.map((id) => {
+    books: ACTIVE_BOOK_IDS.map((id) => {
       const initial = input.books.find((book) => book.id === id)!;
       return { ...initial, availableCents: initial.openingCents, outstandingCents: 0, realizedProfitCents: 0, dailyStakedCents: 0, tickets: [], card: null,
         day: { date: centralDay(now), bankrollCents: initial.openingCents, spentCents: 0, stakedCents: 0 } };
@@ -211,7 +218,27 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
   const ledger = structuredClone(previous);
   ensure(Date.parse(event.occurredAt) <= now.getTime() + 60_000, 'future_event');
   ensure(Date.parse(event.occurredAt) >= Date.parse(ledger.ledgerStart), 'before_ledger_start');
-  const book = ledger.books.find((item) => item.id === event.book)!; rollDay(book, now);
+  if (event.type === 'open_book') {
+    ensure(!ledger.books.some((item) => item.id === event.book), 'book_exists', 409);
+    ledger.books.push({
+      id: event.book, name: event.name, openingCents: event.openingCents, availableCents: event.openingCents, outstandingCents: 0, realizedProfitCents: 0,
+      targetCents: event.targetCents, dailyStakedCents: 0, card: null, tickets: [], policy: event.policy,
+      day: { date: centralDay(now), bankrollCents: event.openingCents, spentCents: 0, stakedCents: 0 },
+    });
+    ledger.updatedAt = now.toISOString();
+    return ledger;
+  }
+  const book = ledger.books.find((item) => item.id === event.book);
+  ensure(book, 'book_not_found', 404);
+  if (event.type === 'retire_book') {
+    ensure(!book.retired, 'book_retired', 409);
+    ensure(!book.tickets.some(isOpen), 'open_tickets', 409);
+    ensure(book.outstandingCents === 0, 'outstanding_exposure', 409);
+    book.retired = true; book.card = null; ledger.updatedAt = now.toISOString();
+    return ledger;
+  }
+  ensure(!book.retired, 'book_retired', 409);
+  rollDay(book, now);
   const currentBudget = book.day;
   const eventDay = centralDay(new Date(event.occurredAt));
   const latePlacement = ['place', 'fill'].includes(event.type) && eventDay !== currentBudget.date;
@@ -225,7 +252,7 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
       ensure(!book.tickets.some((ticket) => ticket.id === event.ticket.id), 'ticket_exists', 409);
       // Keep the Firestore state document bounded; the event journal retains every ticket.
       while (book.tickets.length >= 50) { const index = book.tickets.findIndex((ticket) => !isOpen(ticket)); ensure(index >= 0, 'too_many_open_tickets', 409); book.tickets.splice(index, 1); }
-      validateStake(book, event.ticket.stakeCents, event.ticket.feesCents); validateMarket(book, event.ticket.selections, event.ticket.decimalOdds);
+      validateStake(book, event.ticket.stakeCents, event.ticket.feesCents);
       if (event.ticket.fills) ensure(fillCost(event.ticket.fills) === event.ticket.stakeCents, 'fill_cost_mismatch');
       const ticket: Ticket = { ...event.ticket, book: book.id, status: 'open', placedAt: event.occurredAt, returnCents: null };
       book.tickets.push(ticket); book.availableCents -= ticket.stakeCents + ticket.feesCents; book.outstandingCents += ticket.stakeCents;
@@ -291,7 +318,8 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
 export function applyCards(previous: Ledger, input: PublishCardsRequest, now: Date): Ledger {
   const ledger = structuredClone(previous);
   for (const entry of input.cards) {
-    const book = ledger.books.find((item) => item.id === entry.book)!; rollDay(book, now);
+    const book = ledger.books.find((item) => item.id === entry.book);
+    ensure(book && !book.retired, book ? 'book_retired' : 'book_not_found', book ? 409 : 404); rollDay(book, now);
     ensure(entry.card.date === centralDay(now), 'card_day_mismatch');
     if (entry.card.status === 'ready') validateReadyCard(book, entry.card, now);
     if (entry.card.plannedStakeCents !== undefined) {
@@ -306,8 +334,8 @@ export function applyCards(previous: Ledger, input: PublishCardsRequest, now: Da
 
 export function visibleState(ledger: Ledger | null, now: Date): TrackState {
   if (!ledger) return { updatedAt: null, ledgerStart: null, books: [] };
-  return { updatedAt: ledger.updatedAt, ledgerStart: ledger.ledgerStart, books: ledger.books.map((internal) => {
-    const { policy, day, budgets, ...book } = structuredClone(internal); book.dailyStakedCents = day.date === centralDay(now) ? day.stakedCents : 0;
+  return { updatedAt: ledger.updatedAt, ledgerStart: ledger.ledgerStart, books: ledger.books.filter((internal) => !internal.retired).map((internal) => {
+    const { policy, day, budgets, retired, ...book } = structuredClone(internal); book.dailyStakedCents = day.date === centralDay(now) ? day.stakedCents : 0;
     if (book.card?.status === 'ready') {
       const stale = book.card.date !== centralDay(now) || book.card.selections.some((selection) => Date.parse(selection.startTime) <= now.getTime() || now.getTime() - Date.parse(selection.quotedAt) > policy.quoteMaxAgeMinutes * 60_000);
       if (stale) book.card = { ...book.card, status: 'research', proposedStakeCents: 0, returnCents: null, profitCents: null, summary: `Recheck required. ${book.card.summary}` };

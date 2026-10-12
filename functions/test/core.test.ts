@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { scryptSync } from 'node:crypto';
-import { BOOK_IDS, type BookId, type BootstrapRequest, type Card, type LedgerEvent } from '../../shared/types.js';
+import { ACTIVE_BOOK_IDS, type BookId, type BootstrapRequest, type Card, type LedgerEvent } from '../../shared/types.js';
 import { applyCards, applyEvent, bootstrap, centralDay, parseBootstrap, parseCards, parseEvent, visibleState, type Ledger } from '../src/domain.js';
 import { handle, hashToken, verifyPin, type SessionRecord, type Store } from '../src/service.js';
 
@@ -9,9 +9,9 @@ const now = new Date('2026-06-10T15:00:00.000Z');
 const iso = now.toISOString();
 const selection = (pick = 'Home', odds = 1.1) => ({ event: `Fixture ${pick}`, market: 'Full game moneyline', pick, odds, startTime: '2026-06-10T22:00:00.000Z', quotedAt: iso, sport: 'basketball', settlementRules: 'Includes overtime; postponed events void.', lineupConfirmed: true });
 function initial(): BootstrapRequest {
-  return { idempotencyKey: 'test.bootstrap', ledgerStart: '2026-06-10T14:00:00.000Z', books: BOOK_IDS.map((id) => ({
+  return { idempotencyKey: 'test.bootstrap', ledgerStart: '2026-06-10T14:00:00.000Z', books: ACTIVE_BOOK_IDS.map((id) => ({
     id, name: id, openingCents: 10_000, targetCents: 50_000,
-    policy: { dailyCapCents: ['fliff', 'novig', 'underdog'].includes(id) ? 300 : null, maxBankrollFraction: 1, minimumBankrollFraction: id === 'polymarket' ? .25 : 0, tierFractions: [1, .5, .25], minStakeCents: 100, minReturn: ['polymarket', 'rebet', 'onyx'].includes(id) ? 1.2 : id === 'fliff' ? 2 : null, maxReturn: ['polymarket', 'rebet', 'onyx'].includes(id) ? 1.4 : id === 'fliff' ? 3 : null, minSelections: id === 'novig' ? 1 : 2, minLegImpliedProbability: ['polymarket', 'rebet', 'onyx'].includes(id) ? .90 : null, maxLegImpliedProbability: ['polymarket', 'rebet', 'onyx'].includes(id) ? .95 : null, quoteMaxAgeMinutes: 15 },
+    policy: { dailyCapCents: ['fliff', 'novig', 'underdog'].includes(id) ? 300 : id === 'underdog_streaks' ? 100 : null, maxBankrollFraction: 1, minimumBankrollFraction: id === 'polymarket' ? .25 : 0, tierFractions: [1, .5, .25], minStakeCents: 100, minReturn: ['polymarket', 'rebet'].includes(id) ? 1.2 : id === 'fliff' ? 2 : null, maxReturn: ['polymarket', 'rebet'].includes(id) ? 1.4 : id === 'fliff' ? 3 : null, minSelections: ['novig', 'underdog_streaks'].includes(id) ? 1 : 2, minLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .90 : null, maxLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .95 : null, quoteMaxAgeMinutes: 15 },
   })) };
 }
 function ledger() { return bootstrap(parseBootstrap(initial()), now); }
@@ -75,12 +75,27 @@ test('Novig requires actual exchange fills and counts later fills and fees towar
   l = applyEvent(l, parseEvent({ ...settle('won', 400), book: 'novig' }), now);
   assert.equal(b(l, 'novig').availableCents, 10_195); assert.equal(b(l, 'novig').realizedProfitCents, 195);
 });
-test('parlays are required for the three allocation accounts and must stay in return range', () => {
-  for (const book of ['rebet', 'onyx'] as const) {
-    const event = placed(book); if (event.type !== 'place') continue;
-    event.ticket.selections = [selection()]; assert.throws(() => applyEvent(ledger(), parseEvent(event), now), /insufficient_selections/);
-    event.ticket.selections.push(selection('Away')); event.ticket.decimalOdds = 1.5; assert.throws(() => applyEvent(ledger(), parseEvent(event), now), /return_outside_range/);
-  }
+test('research cards still enforce parlay range; confirmed placements record the actual slip', () => {
+  const card = ready(); card.status = 'research'; card.proposedStakeCents = 0; card.returnCents = null; card.profitCents = null; card.plannedStakeCents = 1000;
+  card.selections = [selection()];
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'short', cards: [{ book: 'rebet', card }] }), now), /insufficient_selections/);
+  card.selections.push(selection('Away')); card.decimalOdds = 1.5;
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'wide', cards: [{ book: 'rebet', card }] }), now), /return_outside_range/);
+  const event = placed('rebet'); if (event.type !== 'place') return;
+  event.ticket.decimalOdds = 1.8;
+  const recorded = applyEvent(ledger(), parseEvent(event), now);
+  assert.equal(b(recorded).availableCents, 9000); assert.equal(b(recorded).tickets[0].decimalOdds, 1.8);
+});
+test('retired books leave the journal and a new book can be opened', () => {
+  let l = ledger();
+  l = applyEvent(l, parseEvent({ idempotencyKey: 'retire.rebet', type: 'retire_book', book: 'rebet', occurredAt: iso, note: 'Removed' }), now);
+  assert.equal(visibleState(l, now).books.some((book) => book.id === 'rebet'), false);
+  assert.throws(() => applyEvent(l, parseEvent(placed('rebet')), now), /book_retired/);
+  const missing = structuredClone(l); missing.books = missing.books.filter((book) => book.id !== 'underdog_streaks');
+  const policy = initial().books.find((book) => book.id === 'underdog_streaks')!.policy;
+  l = applyEvent(missing, parseEvent({ idempotencyKey: 'open.streaks', type: 'open_book', book: 'underdog_streaks', occurredAt: iso, note: 'Opened', name: 'Underdog Streaks', openingCents: 100, targetCents: 40_000, policy }), now);
+  assert.equal(b(l, 'underdog_streaks').availableCents, 100);
+  assert.equal(visibleState(l, now).books.some((book) => book.id === 'underdog_streaks'), true);
 });
 test('caps span daily runs; winnings and new deposits cannot replenish daily risk allowance', () => {
   let l = applyEvent(ledger(), parseEvent(placed('fliff', 300)), now);
