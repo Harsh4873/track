@@ -12,6 +12,8 @@ export interface Selection {
   sport?: string;
   settlementRules?: string;
   lineupConfirmed?: boolean;
+  quoteBasis?: 'app' | 'comparison';
+  quoteSource?: string;
 }
 
 export interface Card {
@@ -21,6 +23,8 @@ export interface Card {
   updatedAt: string;
   tier: Tier | null;
   proposedStakeCents: number;
+  /** Research cards only: the stake to use once the owner sees an acceptable app quote. It never moves funds. */
+  plannedStakeCents?: number;
   minimumStakeCents?: number;
   feesCents?: number;
   decimalOdds: number | null;
@@ -66,6 +70,14 @@ export interface BookState {
   dailyStakedCents: number;
   tickets: Ticket[];
   card: Card | null;
+  lastBalanceReport?: {
+    reportedAt: string;
+    availableCents: number;
+    previousAvailableCents: number;
+    changeCents: number;
+    note: string;
+    establishedDayBaseline: boolean;
+  };
 }
 
 export interface TrackState {
@@ -108,6 +120,7 @@ export type LedgerEvent = EventBase & (
   | { type: 'result'; ticketId: string; resultNote: string }
   | { type: 'settle'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number }
   | { type: 'adjust'; kind: 'deposit' | 'withdrawal' | 'correction'; amountCents: number; relatedEventId?: string }
+  | { type: 'balance_report'; availableCents: number; previousAvailableCents: number; establishDayBaseline?: boolean }
   | { type: 'correct_settlement'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number; relatedEventId: string }
 );
 

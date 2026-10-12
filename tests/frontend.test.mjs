@@ -4,7 +4,11 @@ import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 const source = await readFile('src/presentation.ts', 'utf8');
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
-const { money, safeSourceUrl, progress, calendarDate, age } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
+const { money, safeSourceUrl, progress, calendarDate, age, americanOdds } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
+test('leg prices show American odds for favorites, underdogs and invalid input', () => {
+  assert.equal(americanOdds(1 / 0.96), '-2400'); assert.equal(americanOdds(1 + 100 / 174), '-174'); assert.equal(americanOdds(2.15), '+115');
+  assert.equal(americanOdds(2), '+100'); assert.equal(americanOdds(1), 'Unpriced'); assert.equal(americanOdds(Number.NaN), 'Unpriced');
+});
 test('display formats cents and growth progress without invalid percentages', () => { assert.equal(money(12345), '$123.45'); assert.equal(progress(100, 50, 1000), 15); assert.equal(progress(999, 999, 0), 0); });
 test('source links reject executable URLs and embedded credentials', () => { assert.equal(safeSourceUrl('javascript:alert(1)'), null); assert.equal(safeSourceUrl('https://user:pass@example.com'), null); assert.equal(safeSourceUrl('https://example.com'), 'https://example.com/'); });
 test('calendar-only dates stay on the intended Central day', () => { assert.match(calendarDate('2026-06-10'), /June 10, 2026/); assert.equal(age(null), 'Awaiting first sync'); });
@@ -12,4 +16,75 @@ test('private UI is constructed with DOM text and does not persist session crede
   const src = await readFile('src/main.ts', 'utf8');
   assert.doesNotMatch(src, /innerHTML|localStorage|sessionStorage/);
   assert.match(src, /session = null/); assert.match(src, /state = null/); assert.match(src, /readOnly|proposed|Proposed/);
+});
+const themeSource = await readFile('src/theme.ts', 'utf8');
+const themeJs = ts.transpileModule(themeSource, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
+let themeLoads = 0;
+async function loadTheme({ stored = null, light = false, blocked = false } = {}) {
+  const env = { writes: [], changes: [], metas: [{}, {}], toggles: [], root: { dataset: {} } };
+  env.media = { matches: light, addEventListener: (_, listener) => env.changes.push(listener) };
+  env.system = (matches) => { env.media.matches = matches; env.changes.forEach((listener) => listener({ matches })); };
+  const storage = { getItem: (key) => { if (blocked) throw new Error('blocked'); return key === 'track-theme' ? stored : null; }, setItem: (key, value) => { if (blocked) throw new Error('blocked'); env.writes.push(`${key}=${value}`); } };
+  const createElement = () => { const clicks = []; const toggle = { attrs: {}, setAttribute: (name, value) => { toggle.attrs[name] = value; }, addEventListener: (_, listener) => clicks.push(listener), click: () => clicks.forEach((listener) => listener()) }; env.toggles.push(toggle); return toggle; };
+  const document = { documentElement: env.root, createElement, querySelectorAll: (selector) => selector === '.theme-toggle' ? env.toggles : env.metas };
+  for (const [name, value] of Object.entries({ localStorage: storage, window: { matchMedia: () => env.media }, document })) Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  env.theme = await import(`data:text/javascript;base64,${Buffer.from(`${themeJs}\n// load ${++themeLoads}`).toString('base64')}`);
+  return env;
+}
+test('the theme choice is the only stored value and main.ts never touches storage', async () => {
+  const main = await readFile('src/main.ts', 'utf8');
+  assert.match(themeSource, /const storageKey = 'track-theme';/); assert.equal(themeSource.match(/localStorage/g)?.length, 2);
+  assert.deepEqual([...themeSource.matchAll(/localStorage\.(\w+)\((\w+)/g)].map(([, method, key]) => `${method}(${key})`), ['getItem(storageKey)', 'setItem(storageKey)']);
+  assert.doesNotMatch(themeSource, /sessionStorage|indexedDB|cookie|token|session|\bpin\b|ledger|innerHTML/i);
+  assert.doesNotMatch(main, /innerHTML|localStorage|sessionStorage|indexedDB|document\.cookie/); assert.match(main, /initTheme\(\);\nrenderLock\(\);/);
+});
+test('theme follows the system until the toggle stores an explicit light or dark choice', async () => {
+  const env = await loadTheme();
+  env.theme.initTheme();
+  assert.equal(env.root.dataset.theme, 'dark'); assert.deepEqual(env.metas.map((meta) => meta.content), ['#101719', '#101719']);
+  env.system(true);
+  assert.equal(env.root.dataset.theme, 'light'); assert.deepEqual(env.metas.map((meta) => meta.content), ['#f6f4ef', '#f6f4ef']);
+  const toggle = env.theme.themeToggle();
+  assert.equal(toggle.id, 'theme-toggle'); assert.equal(toggle.type, 'button'); assert.equal(toggle.textContent, '☾');
+  assert.equal(toggle.title, 'Switch to dark mode'); assert.equal(toggle.attrs['aria-label'], 'Switch to dark mode');
+  toggle.click();
+  assert.equal(env.root.dataset.theme, 'dark'); assert.equal(toggle.title, 'Switch to light mode'); assert.equal(toggle.attrs['aria-label'], 'Switch to light mode');
+  env.system(false); env.system(true);
+  assert.equal(env.root.dataset.theme, 'dark'); assert.deepEqual(env.writes, ['track-theme=dark']);
+});
+test('a stored choice wins, unknown values fall back to the system and blocked storage never breaks the toggle', async () => {
+  const stored = await loadTheme({ stored: 'light' });
+  stored.theme.initTheme(); stored.system(false);
+  assert.equal(stored.root.dataset.theme, 'light');
+  const unknown = await loadTheme({ stored: 'sepia', light: true });
+  unknown.theme.initTheme();
+  assert.equal(unknown.root.dataset.theme, 'light');
+  const blocked = await loadTheme({ blocked: true });
+  assert.doesNotThrow(() => blocked.theme.initTheme());
+  const toggle = blocked.theme.themeToggle();
+  assert.doesNotThrow(() => toggle.click()); blocked.system(false);
+  assert.equal(blocked.root.dataset.theme, 'light'); assert.deepEqual(blocked.writes, []);
+});
+test('stylesheet keeps every color in matching dark and light palettes', async () => {
+  const [css, html] = await Promise.all(['src/style.css', 'index.html'].map((path) => readFile(path, 'utf8')));
+  const blocks = [/:root\{([^}]*)\}/, /:root\[data-theme=light\]\{([^}]*)\}/, /@media\s*\(prefers-color-scheme:\s*light\)\s*\{\s*:root:not\(\[data-theme=dark\]\)\{([^}]*)\}\s*\}/].map((pattern) => css.match(pattern));
+  assert.ok(blocks.every(Boolean), 'dark, explicit light and system light palettes are defined');
+  const [dark, light, system] = blocks.map((match) => match[1]);
+  const tokens = (body) => Object.fromEntries([...body.matchAll(/(--[\w-]+):([^;]+)/g)].map(([, name, value]) => [name, value]));
+  assert.equal(system, light); assert.deepEqual(Object.keys(tokens(light)), Object.keys(tokens(dark)));
+  assert.match(dark, /color-scheme:dark/); assert.match(light, /color-scheme:light/);
+  const outside = blocks.reduce((rest, match) => rest.replace(match[0], ''), css) + dark.replace(/--[\w-]+:[^;]+/g, '');
+  assert.doesNotMatch(outside, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i);
+  const bg = { dark: tokens(dark)['--bg'], light: tokens(light)['--bg'] };
+  assert.match(themeSource, new RegExp(`dark: '${bg.dark}', light: '${bg.light}'`));
+  for (const scheme of ['dark', 'light']) assert.match(html, new RegExp(`<meta name="theme-color" content="${bg[scheme]}" media="\\(prefers-color-scheme: ${scheme}\\)" />`));
+  assert.match(html, /<meta name="color-scheme" content="dark light" \/>/); assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/);
+});
+test('light palette text meets WCAG AA contrast on its background', async () => {
+  const css = await readFile('src/style.css', 'utf8');
+  const light = Object.fromEntries([...css.match(/:root\[data-theme=light\]\{([^}]*)\}/)[1].matchAll(/--([\w-]+):(#[0-9a-f]{6})(?![0-9a-f])/gi)].map(([, name, value]) => [name, value]));
+  const luminance = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+  const ratio = (a, b) => { const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (high + 0.05) / (low + 0.05); };
+  const pairs = { bg: 'text muted dim accent quiet-text field-label form-status motto sync-text empty-symbol', panel: 'text muted dim positive negative metric-label', 'detail-bg': 'text muted dim accent positive negative badge-text pending-text tier-text market-text small-heading link-hover empty-symbol ticket-status ticket-total', 'quote-bg': 'text muted', accent: 'on-accent mark-ink', 'accent-hover': 'on-accent', 'quiet-hover': 'quiet-text', 'ready-bg': 'accent', 'skip-bg': 'skip-text', 'pending-bg': 'pending-text', 'notice-bg': 'notice-text', 'error-bg': 'error-text' };
+  for (const [background, texts] of Object.entries(pairs)) for (const text of texts.split(' ')) assert.ok(ratio(light[text], light[background]) >= 4.5, `${text} on ${background}`);
 });

@@ -33,6 +33,8 @@ function validateSelection(value: unknown): asserts value is Selection {
   if (value.sport !== undefined) text(value.sport, 80);
   if (value.settlementRules !== undefined) text(value.settlementRules, 2000);
   if (value.lineupConfirmed !== undefined) ensure(typeof value.lineupConfirmed === 'boolean');
+  if (value.quoteBasis !== undefined) ensure(value.quoteBasis === 'app' || value.quoteBasis === 'comparison');
+  if (value.quoteSource !== undefined) text(value.quoteSource, 500);
   ensure(!/\btennis\b/i.test(`${value.sport ?? ''} ${value.event} ${value.market}`), 'excluded_sport');
 }
 
@@ -97,6 +99,10 @@ export function parseEvent(value: unknown): LedgerEvent {
       if (value.type === 'correct_settlement') key(value.relatedEventId);
       break;
     case 'adjust': ensure(['deposit', 'withdrawal', 'correction'].includes(value.kind as string)); integer(value.amountCents, true); ensure(value.amountCents !== 0); if (value.kind === 'deposit') ensure(value.amountCents > 0); if (value.kind === 'withdrawal') ensure(value.amountCents < 0); if (value.kind === 'correction') key(value.relatedEventId); break;
+    case 'balance_report':
+      integer(value.availableCents); integer(value.previousAvailableCents);
+      if (value.establishDayBaseline !== undefined) ensure(typeof value.establishDayBaseline === 'boolean');
+      break;
     default: throw new ApiError(400, 'invalid_event');
   }
   return value as unknown as LedgerEvent;
@@ -120,6 +126,7 @@ export function parseCards(value: unknown): PublishCardsRequest {
       if (card.verification.jurisdiction !== undefined) ensure(card.verification.jurisdiction === 'US');
     }
     if (card.status !== 'ready') ensure(card.proposedStakeCents === 0 && card.returnCents === null && card.profitCents === null, 'nonready_card_cannot_stake');
+    if (card.plannedStakeCents !== undefined) { integer(card.plannedStakeCents); ensure(card.status === 'research' && card.plannedStakeCents > 0 && card.selections.length > 0, 'planned_stake_requires_research_card'); }
   }
   return value as unknown as PublishCardsRequest;
 }
@@ -160,11 +167,11 @@ function validateStake(book: InternalBook, stakeCents: number, feesCents: number
   ensure(!initial || cost >= Math.ceil(book.day.bankrollCents * book.policy.minimumBankrollFraction), 'below_minimum_allocation');
 }
 
-function validateMarket(book: InternalBook, selections: Selection[], decimalOdds: number | null): void {
+function validateMarket(book: InternalBook, selections: Selection[], decimalOdds: number | null, requirePrice = true): void {
   ensure(selections.length >= book.policy.minSelections, 'insufficient_selections');
-  ensure(decimalOdds !== null, 'accepted_price_required');
-  if (book.policy.minReturn !== null) ensure(decimalOdds + 1e-8 >= book.policy.minReturn, 'return_outside_range');
-  if (book.policy.maxReturn !== null) ensure(decimalOdds - 1e-8 <= book.policy.maxReturn, 'return_outside_range');
+  ensure(decimalOdds !== null || !requirePrice, 'accepted_price_required');
+  if (decimalOdds !== null && book.policy.minReturn !== null) ensure(decimalOdds + 1e-8 >= book.policy.minReturn, 'return_outside_range');
+  if (decimalOdds !== null && book.policy.maxReturn !== null) ensure(decimalOdds - 1e-8 <= book.policy.maxReturn, 'return_outside_range');
   for (const selection of selections) {
     if (book.policy.minLegImpliedProbability !== null || book.policy.maxLegImpliedProbability !== null) {
       ensure(selection.odds !== null, 'leg_price_required');
@@ -185,6 +192,7 @@ function validateReadyCard(book: InternalBook, card: Card, now: Date): void {
   validateStake(book, card.proposedStakeCents, card.feesCents);
   validateMarket(book, card.selections, card.decimalOdds);
   for (const selection of card.selections) {
+    ensure(selection.quoteBasis !== 'comparison', 'comparison_quote_not_actionable');
     ensure(selection.sport && selection.settlementRules && selection.lineupConfirmed === true, 'incomplete_selection');
     ensure(Date.parse(selection.startTime) > now.getTime(), 'market_started');
     const age = now.getTime() - Date.parse(selection.quotedAt);
@@ -254,6 +262,25 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
       ensure(book.availableCents + event.amountCents >= 0, 'insufficient_balance', 409);
       book.availableCents += event.amountCents;
       break;
+    case 'balance_report': {
+      ensure(book.availableCents === event.previousAvailableCents, 'balance_report_conflict', 409);
+      if (event.establishDayBaseline) {
+        ensure(eventDay === currentBudget.date, 'balance_baseline_day_mismatch', 409);
+        ensure(book.day.spentCents === 0 && book.day.stakedCents === 0, 'balance_baseline_budget_consumed', 409);
+        ensure(!book.tickets.some((ticket) => centralDay(new Date(ticket.placedAt)) === currentBudget.date || (ticket.settledAt && centralDay(new Date(ticket.settledAt)) === currentBudget.date)), 'balance_baseline_ticket_activity', 409);
+        book.day.bankrollCents = event.availableCents;
+      }
+      book.lastBalanceReport = {
+        reportedAt: event.occurredAt,
+        availableCents: event.availableCents,
+        previousAvailableCents: event.previousAvailableCents,
+        changeCents: event.availableCents - event.previousAvailableCents,
+        note: event.note,
+        establishedDayBaseline: event.establishDayBaseline === true,
+      };
+      book.availableCents = event.availableCents;
+      break;
+    }
   }
   integer(book.availableCents); integer(book.outstandingCents); integer(book.realizedProfitCents, true);
   if (latePlacement) { currentBudget.bankrollCents = Math.max(0, currentBudget.bankrollCents - (availableBefore - book.availableCents)); book.day = currentBudget; }
@@ -267,6 +294,11 @@ export function applyCards(previous: Ledger, input: PublishCardsRequest, now: Da
     const book = ledger.books.find((item) => item.id === entry.book)!; rollDay(book, now);
     ensure(entry.card.date === centralDay(now), 'card_day_mismatch');
     if (entry.card.status === 'ready') validateReadyCard(book, entry.card, now);
+    if (entry.card.plannedStakeCents !== undefined) {
+      ensure(book.availableCents < book.targetCents, 'target_reached', 409);
+      ensure(entry.card.plannedStakeCents <= stakeLimit(book), 'daily_limit_exceeded', 409);
+      validateMarket(book, entry.card.selections, entry.card.decimalOdds, false);
+    }
     book.card = { ...entry.card, updatedAt: now.toISOString() };
   }
   ledger.updatedAt = now.toISOString(); return ledger;

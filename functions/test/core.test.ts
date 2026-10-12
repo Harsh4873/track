@@ -89,6 +89,51 @@ test('caps span daily runs; winnings and new deposits cannot replenish daily ris
   const again = placed('fliff', 100); if (again.type !== 'place') return; again.ticket.id = 'ticket.2';
   assert.throws(() => applyEvent(l, parseEvent(again), now), /daily_limit_exceeded/);
 });
+test('reported available balance preserves opening funds, exposure and realized profit', () => {
+  let l = applyEvent(ledger(), parseEvent(placed()), now);
+  l = applyEvent(l, parseEvent(settle()), now);
+  const second = placed(); if (second.type !== 'place') return; second.ticket.id = 'ticket.2'; second.idempotencyKey = 'placed.2';
+  l = applyEvent(l, parseEvent(second), now);
+  const before = structuredClone(b(l));
+  const event = { idempotencyKey: 'balance.1', type: 'balance_report', book: 'rebet', occurredAt: iso, note: 'User reported current available cash; origin unspecified.', availableCents: 12_345, previousAvailableCents: before.availableCents };
+  l = applyEvent(l, parseEvent(event), now);
+  const after = b(l);
+  assert.equal(after.availableCents, 12_345);
+  assert.equal(after.openingCents, before.openingCents);
+  assert.equal(after.realizedProfitCents, before.realizedProfitCents);
+  assert.equal(after.outstandingCents, before.outstandingCents);
+  assert.deepEqual(after.tickets, before.tickets);
+  assert.deepEqual(after.day, before.day);
+  assert.deepEqual(after.lastBalanceReport, { reportedAt: iso, availableCents: 12_345, previousAvailableCents: before.availableCents, changeCents: 12_345 - before.availableCents, note: event.note, establishedDayBaseline: false });
+  assert.deepEqual(visibleState(l, now).books.find((book) => book.id === 'rebet')!.lastBalanceReport, after.lastBalanceReport);
+});
+test('balance reports reject stale comparisons and invalid amounts', () => {
+  const event = { idempotencyKey: 'balance.stale', type: 'balance_report', book: 'rebet', occurredAt: iso, note: 'Reported available cash', availableCents: 12_345, previousAvailableCents: 9999 };
+  assert.throws(() => applyEvent(ledger(), parseEvent(event), now), /balance_report_conflict/);
+  assert.throws(() => parseEvent({ ...event, availableCents: -1 }), /invalid_request/);
+  assert.throws(() => parseEvent({ ...event, previousAvailableCents: 1.5 }), /invalid_request/);
+  assert.throws(() => parseEvent({ ...event, establishDayBaseline: 'true' }), /invalid_request/);
+});
+test('an unused day may adopt a reported bankroll without rewriting opening balance', () => {
+  const event = { idempotencyKey: 'balance.baseline', type: 'balance_report', book: 'rebet', occurredAt: iso, note: 'User reported opening available cash for this day', availableCents: 12_345, previousAvailableCents: 10_000, establishDayBaseline: true };
+  const l = applyEvent(ledger(), parseEvent(event), now);
+  assert.equal(b(l).day.bankrollCents, 12_345); assert.equal(b(l).day.spentCents, 0); assert.equal(b(l).openingCents, 10_000);
+  assert.equal(b(l).realizedProfitCents, 0); assert.equal(b(l).lastBalanceReport?.establishedDayBaseline, true);
+});
+test('balance reports cannot reset consumed caps or bankrolls after settlement activity', () => {
+  let l = applyEvent(ledger(), parseEvent(placed('fliff', 300)), now);
+  const event = { idempotencyKey: 'balance.used', type: 'balance_report', book: 'fliff', occurredAt: iso, note: 'User reported current available cash', availableCents: 15_000, previousAvailableCents: 9700, establishDayBaseline: true };
+  assert.throws(() => applyEvent(l, parseEvent(event), now), /balance_baseline_budget_consumed/);
+  l = applyEvent(l, parseEvent({ ...event, establishDayBaseline: false }), now);
+  assert.equal(b(l, 'fliff').day.spentCents, 300); assert.equal(b(l, 'fliff').day.bankrollCents, 10_000);
+  const again = placed('fliff', 100); if (again.type !== 'place') return; again.ticket.id = 'ticket.2';
+  assert.throws(() => applyEvent(l, parseEvent(again), now), /daily_limit_exceeded/);
+  const next = new Date('2026-06-11T15:00:00Z');
+  l = applyEvent(l, parseEvent({ ...settle('won', 675), book: 'fliff', occurredAt: next.toISOString() }), next);
+  assert.equal(b(l, 'fliff').day.spentCents, 0);
+  assert.throws(() => applyEvent(l, parseEvent({ ...event, occurredAt: next.toISOString(), previousAvailableCents: b(l, 'fliff').availableCents }), next), /balance_baseline_ticket_activity/);
+  assert.throws(() => applyEvent(ledger(), parseEvent({ ...event, book: 'rebet', previousAvailableCents: 10_000 }), next), /balance_baseline_day_mismatch/);
+});
 test('late confirmations retain original date and the earlier daily cap', () => {
   let l = ledger(); const next = new Date('2026-06-11T15:00:00Z');
   l = applyCards(l, parseCards({ idempotencyKey: 'next.card', cards: [{ book: 'rebet', card: { ...ready(), date: '2026-06-11', status: 'skip', proposedStakeCents: 0, returnCents: null, profitCents: null } }] }), next);
@@ -102,6 +147,29 @@ test('stale quotes, started events, excluded sports and absent confirmations fai
   const event = placed(); if (event.type !== 'place') return; event.ticket.selections[0].sport = 'tennis'; assert.throws(() => parseEvent(event), /excluded_sport/);
   assert.throws(() => parseEvent({ ...placed(), placementConfirmed: false }), /placement_confirmation_required/);
   assert.throws(() => parseEvent({ ...settle(), appSettlementConfirmed: false }), /settlement_confirmation_required/);
+});
+test('comparison quotes may inform research but cannot be published as actionable app prices', () => {
+  const card = ready(); card.selections[0].quoteBasis = 'comparison'; card.selections[0].quoteSource = 'Comparison operator';
+  const input = { idempotencyKey: 'comparison.ready', cards: [{ book: 'rebet' as const, card }] };
+  assert.throws(() => applyCards(ledger(), parseCards(input), now), /comparison_quote_not_actionable/);
+  card.status = 'research'; card.proposedStakeCents = 0; card.returnCents = null; card.profitCents = null;
+  const research = applyCards(ledger(), parseCards(input), now); assert.equal(b(research).card!.selections[0].quoteSource, 'Comparison operator');
+  assert.throws(() => parseCards({ ...input, cards: [{ book: 'rebet', card: { ...card, selections: [{ ...card.selections[0], quoteBasis: 'unknown' }] } }] }), /invalid_request/);
+  assert.throws(() => parseCards({ ...input, cards: [{ book: 'rebet', card: { ...card, selections: [{ ...card.selections[0], quoteSource: '' }] } }] }), /invalid_request/);
+});
+test('planned stakes stay on research cards, respect limits and never move funds', () => {
+  const card = ready(); card.status = 'research'; card.proposedStakeCents = 0; card.returnCents = null; card.profitCents = null; card.plannedStakeCents = 10_000;
+  card.selections = card.selections.map((s) => ({ ...s, quoteBasis: 'comparison' as const, quoteSource: 'Comparison operator' }));
+  const input = { idempotencyKey: 'planned', cards: [{ book: 'rebet' as const, card }] };
+  const l = applyCards(ledger(), parseCards(input), now);
+  assert.equal(b(l).availableCents, 10_000); assert.equal(b(l).outstandingCents, 0); assert.equal(b(l).card!.plannedStakeCents, 10_000);
+  assert.throws(() => applyCards(ledger(), parseCards({ ...input, cards: [{ book: 'rebet', card: { ...card, plannedStakeCents: 10_001 } }] }), now), /daily_limit_exceeded/);
+  assert.throws(() => applyCards(ledger(), parseCards({ ...input, cards: [{ book: 'fliff', card: { ...card, decimalOdds: 2.25, plannedStakeCents: 301 } }] }), now), /daily_limit_exceeded/);
+  assert.throws(() => applyCards(ledger(), parseCards({ ...input, cards: [{ book: 'rebet', card: { ...card, decimalOdds: 1.5 } }] }), now), /return_outside_range/);
+  assert.throws(() => parseCards({ ...input, cards: [{ book: 'rebet', card: { ...ready(), plannedStakeCents: 1000 } }] }), /planned_stake_requires_research_card/);
+  assert.throws(() => parseCards({ ...input, cards: [{ book: 'rebet', card: { ...card, status: 'skip' } }] }), /planned_stake_requires_research_card/);
+  const underdog = { ...card, decimalOdds: null, plannedStakeCents: 200, selections: card.selections.map((s) => ({ ...s, odds: null })) };
+  assert.equal(b(applyCards(ledger(), parseCards({ ...input, cards: [{ book: 'underdog', card: underdog }] }), now), 'underdog').card!.plannedStakeCents, 200);
 });
 test('target pauses new proposals and old cards lose actionable status', () => {
   const l = ledger(); b(l).availableCents = b(l).targetCents;

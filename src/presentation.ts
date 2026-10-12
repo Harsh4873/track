@@ -40,6 +40,12 @@ export function age(value: string | null | undefined, now = Date.now()): string 
   return `Updated ${Math.floor(minutes / 1440)}d ago`;
 }
 
+export function americanOdds(decimal: number): string {
+  if (!Number.isFinite(decimal) || decimal <= 1) return 'Unpriced';
+  const value = Math.round(decimal >= 2 ? (decimal - 1) * 100 : -100 / (decimal - 1));
+  return value > 0 ? `+${value}` : String(value);
+}
+
 export function safeSourceUrl(value: string): string | null {
   try {
     const url = new URL(value);

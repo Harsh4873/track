@@ -1,6 +1,7 @@
 import './style.css';
 import type { BookState, Card, Selection, Ticket, TrackState } from '../shared/types';
-import { age, calendarDate, money, progress, safeSourceUrl, signedMoney, timestamp } from './presentation';
+import { age, americanOdds, calendarDate, money, progress, safeSourceUrl, signedMoney, timestamp } from './presentation';
+import { initTheme, themeToggle } from './theme';
 
 type Child = Node | string | null | undefined;
 type Session = { token: string; expiresAt: string };
@@ -116,7 +117,7 @@ function renderLock(focus = false) {
       input.focus();
     }
   });
-  const header = el('header', 'site-header lock-header', brand(), text('span', 'PRIVATE JOURNAL', 'eyebrow header-label'));
+  const header = el('header', 'site-header lock-header', brand(), el('div', 'header-actions', text('span', 'PRIVATE JOURNAL', 'eyebrow header-label'), themeToggle()));
   const lockIcon = el('span', 'lock-icon', '↗');
   lockIcon.setAttribute('aria-hidden', 'true');
   const panel = el('section', 'unlock-panel', lockIcon, text('p', 'THE DAILY DESK', 'eyebrow'), text('h1', 'Every move.\nIn perspective.'), description, form, text('p', 'Your code is checked securely. Records stay locked until you open them.', 'privacy-note'));
@@ -198,7 +199,7 @@ function renderJournal() {
   const refreshButton = button(refreshing ? 'Refreshing…' : 'Refresh', 'button button-quiet', () => void refresh());
   refreshButton.id = 'refresh';
   refreshButton.disabled = refreshing;
-  const header = el('header', 'site-header', brand(), el('div', 'header-actions', text('span', 'PRIVATE', 'privacy-badge'), button('Lock journal', 'button button-quiet', () => void lock())));
+  const header = el('header', 'site-header', brand(), el('div', 'header-actions', text('span', 'PRIVATE', 'privacy-badge'), button('Lock journal', 'button button-quiet', () => void lock()), themeToggle()));
   const title = el('div', 'page-heading', el('div', '', text('p', 'THE DAILY DESK', 'eyebrow'), text('h1', 'Your journal.'), text('p', 'Clear records. Considered decisions.', 'page-subtitle')), el('div', 'sync-block', text('span', age(state?.updatedAt), 'sync-age'), text('small', state?.updatedAt ? timestamp(state.updatedAt) : 'Records load after the first sync', 'muted'), refreshButton));
   const main = el('main', 'journal-main', title);
   if (refreshError) main.append(banner(`${refreshError}${state ? ' Showing the last retrieved record. Recheck current prices before acting.' : ''}`, 'error'));
@@ -269,6 +270,10 @@ function renderBook(book: BookState) {
   const goal = el('div', 'goal-row', el('div', 'goal-copy', text('span', 'Growth goal', 'metric-label'), text('span', `${money(equity)} / ${money(book.targetCents)}`, 'goal-amount')), progressBar, text('span', pct >= 100 ? 'Goal reached · time to reassess' : 'Available balance · no deadline', 'goal-caption'));
   balance.append(goal);
   panel.append(balance);
+  if (book.lastBalanceReport) {
+    const report = book.lastBalanceReport;
+    panel.append(text('p', `Last reported balance: ${money(report.availableCents)} · ${timestamp(report.reportedAt)}. Balance adjustments are excluded from realized P&L.`, 'ledger-note'));
+  }
   const pending = book.tickets.filter((ticket) => ticket.status === 'result_pending').length;
   if (pending > 0) panel.append(banner(`${pending} ticket${pending === 1 ? ' is' : 's are'} awaiting confirmed app settlement. Expected returns are not available funds.`));
   panel.append(el('div', 'detail-grid', renderCard(book.card), renderHistory(book.tickets)));
@@ -285,19 +290,26 @@ function renderCard(card: Card | null) {
     section.append(sectionHeader('THE CARD', 'Nothing proposed yet'), el('div', 'card-empty', text('span', '—', 'empty-symbol'), text('p', 'The next research update will appear here.', 'empty-title'), text('p', 'A clear no-bet decision is part of the record, too.', 'muted')));
     return section;
   }
-  const labels = { ready: 'Proposed', skip: 'No bet', research: 'Under review' };
+  const planned = card.status === 'research' && card.plannedStakeCents ? card.plannedStakeCents : null;
+  const labels = { ready: 'Proposed', skip: 'No bet', research: planned ? 'Check in app' : 'Under review' };
   const status = labels[card.status] || 'Under review';
   section.append(sectionHeader('THE CARD', calendarDate(card.date), text('span', status, `status-badge status-${card.status}`)));
-  const cardSummary = el('div', 'card-summary', text('h3', card.status === 'ready' ? 'For your consideration' : card.status === 'skip' ? 'Sitting this one out.' : 'Still checking the details.'), text('p', card.summary));
+  const heading = card.status === 'ready' ? 'For your consideration' : card.status === 'skip' ? 'Sitting this one out.' : planned ? 'Check the price in your app.' : 'Still checking the details.';
+  const cardSummary = el('div', 'card-summary', text('h3', heading), text('p', card.summary));
   if (card.tier !== null) cardSummary.append(text('span', `Tier ${card.tier} · research judgment`, 'tier-label'));
   section.append(cardSummary);
+  const detail = (label: string, value: string) => el('div', '', text('span', label, 'quote-label'), text('strong', value, 'quote-value'));
+  if (planned) {
+    const estimate = card.decimalOdds === null ? null : Math.round(planned * card.decimalOdds);
+    section.append(el('div', 'quote-grid', detail('Planned stake', money(planned)), detail('Est. total return', estimate === null ? 'See app' : money(estimate)), detail('Est. profit', estimate === null ? 'See app' : signedMoney(estimate - planned)), detail('Est. multiple', card.decimalOdds === null ? 'See app' : `${card.decimalOdds.toFixed(2)}×`)));
+    section.append(text('p', 'Estimated from the prices listed below. Your app\'s quote decides, and nothing is recorded until you confirm a placed slip.', 'fine-print plan-note'));
+  }
   if (card.selections.length) {
     const selections = el('ol', 'selections');
     card.selections.forEach((selection, index) => selections.append(renderSelection(selection, index)));
     section.append(selections);
   }
   if (card.status === 'ready') {
-    const detail = (label: string, value: string) => el('div', '', text('span', label, 'quote-label'), text('strong', value, 'quote-value'));
     section.append(el('div', 'quote-grid', detail('Proposed stake', money(card.proposedStakeCents)), detail('Total return', card.returnCents === null ? 'Unconfirmed' : money(card.returnCents)), detail('Potential profit', card.profitCents === null ? 'Unconfirmed' : signedMoney(card.profitCents)), detail('Return multiple', card.decimalOdds === null ? 'Unconfirmed' : `${card.decimalOdds.toFixed(2)}×`)));
     section.append(text('p', `Total return includes the stake. Estimated fees: ${money(card.feesCents ?? 0)}. This is a proposal, not a placed ticket.`, 'fine-print'));
   }
@@ -322,7 +334,8 @@ function renderCard(card: Card | null) {
 }
 
 function renderSelection(selection: Selection, index: number) {
-  return el('li', 'selection', text('span', String(index + 1).padStart(2, '0'), 'selection-number'), el('div', 'selection-copy', text('p', selection.event, 'selection-event'), text('h3', selection.pick, 'selection-pick'), text('p', selection.market, 'selection-market'), el('div', 'selection-meta', text('span', timestamp(selection.startTime)), text('span', selection.odds === null ? 'Price unconfirmed' : `${selection.odds.toFixed(3)} decimal`)), text('p', `Quote checked ${timestamp(selection.quotedAt)}`, 'quote-time')));
+  const quoteLabel = selection.quoteBasis === 'comparison' ? `Comparison price${selection.quoteSource ? ` · ${selection.quoteSource}` : ''}; verify in your app` : selection.quoteSource || 'Quote';
+  return el('li', 'selection', text('span', String(index + 1).padStart(2, '0'), 'selection-number'), el('div', 'selection-copy', text('p', selection.event, 'selection-event'), text('h3', selection.pick, 'selection-pick'), text('p', selection.market, 'selection-market'), el('div', 'selection-meta', text('span', timestamp(selection.startTime)), text('span', selection.odds === null ? 'Price unconfirmed' : `${americanOdds(selection.odds)} · ${(100 / selection.odds).toFixed(1)}% implied`)), text('p', `${quoteLabel} · checked ${timestamp(selection.quotedAt)}`, 'quote-time')));
 }
 
 function renderHistory(tickets: Ticket[]) {
@@ -366,4 +379,5 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => setLock());
 setInterval(() => { if (session && !document.hidden) void refresh(); }, 60_000);
+initTheme();
 renderLock();
