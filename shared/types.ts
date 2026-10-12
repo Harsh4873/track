@@ -1,5 +1,5 @@
-export const BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'onyx', 'underdog', 'underdog_streaks'] as const;
-export const ACTIVE_BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'underdog', 'underdog_streaks'] as const;
+export const BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'novig_credit', 'onyx', 'underdog', 'underdog_streaks'] as const;
+export const ACTIVE_BOOK_IDS = ['polymarket', 'fliff', 'rebet', 'novig', 'novig_credit', 'underdog', 'underdog_streaks'] as const;
 export type BookId = (typeof BOOK_IDS)[number];
 export type ActiveBookId = (typeof ACTIVE_BOOK_IDS)[number];
 export type Tier = 1 | 2 | 3;
@@ -72,6 +72,8 @@ export interface BookState {
   dailyStakedCents: number;
   tickets: Ticket[];
   card: Card | null;
+  /** True when this balance is playthrough credit. */
+  playthrough?: boolean;
   retired?: boolean;
   lastBalanceReport?: {
     reportedAt: string;
@@ -101,6 +103,8 @@ export interface BookPolicy {
   minLegImpliedProbability: number | null;
   maxLegImpliedProbability: number | null;
   quoteMaxAgeMinutes: number;
+  /** Wagering requirement. Available cash may sit at the target without freezing confirmed placement. */
+  playthrough?: boolean;
 }
 
 export interface BootstrapRequest {
@@ -112,7 +116,7 @@ export interface BootstrapRequest {
 interface EventBase {
   idempotencyKey: string;
   book: BookId;
-  /** Actual occurrence; events may not be backdated into a previous accounting day. */
+  /** Actual occurrence; earlier placement days require an existing accounting budget. */
   occurredAt: string;
   note: string;
 }
@@ -127,6 +131,14 @@ export type LedgerEvent = EventBase & (
   | { type: 'retire_book' }
   | { type: 'open_book'; name: string; openingCents: number; targetCents: number; policy: BookPolicy }
   | { type: 'correct_settlement'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number; relatedEventId: string }
+  | {
+    type: 'correct_place';
+    placementConfirmed: true;
+    relatedEventId?: string;
+    supersede?: string[];
+    targetCents?: number;
+    tickets?: { id: string; stakeCents: number; feesCents: number; decimalOdds: number | null; selections: Selection[]; tier: Tier; fills?: ExchangeFill[]; placedAt?: string }[];
+  }
 );
 
 export interface PublishCardsRequest {

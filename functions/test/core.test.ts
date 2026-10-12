@@ -10,8 +10,8 @@ const iso = now.toISOString();
 const selection = (pick = 'Home', odds = 1.1) => ({ event: `Fixture ${pick}`, market: 'Full game moneyline', pick, odds, startTime: '2026-06-10T22:00:00.000Z', quotedAt: iso, sport: 'basketball', settlementRules: 'Includes overtime; postponed events void.', lineupConfirmed: true });
 function initial(): BootstrapRequest {
   return { idempotencyKey: 'test.bootstrap', ledgerStart: '2026-06-10T14:00:00.000Z', books: ACTIVE_BOOK_IDS.map((id) => ({
-    id, name: id, openingCents: 10_000, targetCents: 50_000,
-    policy: { dailyCapCents: ['fliff', 'novig', 'underdog'].includes(id) ? 300 : id === 'underdog_streaks' ? 100 : null, maxBankrollFraction: 1, minimumBankrollFraction: id === 'polymarket' ? .25 : 0, tierFractions: [1, .5, .25], minStakeCents: 100, minReturn: ['polymarket', 'rebet'].includes(id) ? 1.2 : id === 'fliff' ? 2 : null, maxReturn: ['polymarket', 'rebet'].includes(id) ? 1.4 : id === 'fliff' ? 3 : null, minSelections: ['novig', 'underdog_streaks'].includes(id) ? 1 : 2, minLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .90 : null, maxLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .95 : null, quoteMaxAgeMinutes: 15 },
+    id, name: id, openingCents: id === 'novig_credit' ? 1_000 : 10_000, targetCents: id === 'novig_credit' ? 1_000 : 50_000,
+    policy: { dailyCapCents: id === 'novig_credit' ? null : ['fliff', 'novig', 'underdog'].includes(id) ? 300 : id === 'underdog_streaks' ? 100 : null, maxBankrollFraction: 1, minimumBankrollFraction: id === 'polymarket' ? .25 : 0, tierFractions: [1, .5, .25], minStakeCents: 100, minReturn: id === 'novig_credit' ? null : ['polymarket', 'rebet'].includes(id) ? 1.2 : id === 'fliff' ? 2 : null, maxReturn: id === 'novig_credit' ? null : ['polymarket', 'rebet'].includes(id) ? 1.4 : id === 'fliff' ? 3 : null, minSelections: ['novig', 'novig_credit', 'underdog_streaks'].includes(id) ? 1 : 2, minLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .90 : null, maxLegImpliedProbability: ['polymarket', 'rebet'].includes(id) ? .95 : null, quoteMaxAgeMinutes: 15, playthrough: id === 'novig_credit' ? true : undefined },
   })) };
 }
 function ledger() { return bootstrap(parseBootstrap(initial()), now); }
@@ -23,8 +23,12 @@ function ready(): Card { return { date: '2026-06-10', status: 'ready', summary: 
 const b = (l: Ledger, id: BookId = 'rebet') => l.books.find((x) => x.id === id)!;
 
 test('bootstrap and display never expose server policies or budgets', () => {
-  const state = visibleState(ledger(), now); assert.equal(state.books.length, 6);
+  const state = visibleState(ledger(), now); assert.equal(state.books.length, 7);
   assert.equal('policy' in state.books[0], false); assert.equal('day' in state.books[0], false); assert.equal('budgets' in state.books[0], false);
+  const credit = state.books.find((book) => book.id === 'novig_credit')!;
+  assert.equal(credit.openingCents, 1000); assert.equal(credit.targetCents, 1000); assert.equal(credit.availableCents, 1000); assert.equal(credit.playthrough, true);
+  assert.equal('policy' in credit, false); assert.equal('day' in credit, false);
+  assert.equal(state.books.some((book) => book.id !== 'novig_credit' && book.playthrough), false);
 });
 test('proposals never deduct funds; a missing actual combined quote is rejected', () => {
   const input = { idempotencyKey: 'card.1', cards: [{ book: 'rebet' as const, card: ready() }] };
@@ -60,7 +64,9 @@ test('Polymarket minimum allocation is 25%, not a maximum; full balance remains 
   event.ticket.fills = [{ id: 'fill.full', quantity: 125, priceCents: 80 }];
   assert.equal(b(applyEvent(ledger(), parseEvent(event), now), 'polymarket').availableCents, 0);
   event.ticket.stakeCents = 2000; event.ticket.fills = [{ id: 'fill.small', quantity: 25, priceCents: 80 }];
-  assert.throws(() => applyEvent(ledger(), parseEvent(event), now), /below_minimum_allocation/);
+  assert.equal(b(applyEvent(ledger(), parseEvent(event), now), 'polymarket').availableCents, 8000);
+  const card = ready(); card.proposedStakeCents = 2000; card.returnCents = 2420; card.profitCents = 420;
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'pm.floor', cards: [{ book: 'polymarket', card }] }), now), /below_minimum_allocation/);
 });
 test('Novig requires actual exchange fills and counts later fills and fees toward its cap', () => {
   const event = placed('novig', 100); if (event.type !== 'place') return;
@@ -101,8 +107,9 @@ test('caps span daily runs; winnings and new deposits cannot replenish daily ris
   let l = applyEvent(ledger(), parseEvent(placed('fliff', 300)), now);
   l = applyEvent(l, parseEvent({ ...settle('won', 675), book: 'fliff' }), now);
   l = applyEvent(l, parseEvent({ idempotencyKey: 'deposit.1', type: 'adjust', book: 'fliff', occurredAt: iso, note: 'Confirmed deposit', kind: 'deposit', amountCents: 10_000 }), now);
-  const again = placed('fliff', 100); if (again.type !== 'place') return; again.ticket.id = 'ticket.2';
-  assert.throws(() => applyEvent(l, parseEvent(again), now), /daily_limit_exceeded/);
+  const card = ready(); card.proposedStakeCents = 100; card.decimalOdds = 2.25; card.returnCents = 225; card.profitCents = 125;
+  card.selections = [selection('Home', 1.5), selection('Away', 1.5)];
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'fliff.cap.card', cards: [{ book: 'fliff', card }] }), now), /daily_limit_exceeded/);
 });
 test('reported available balance preserves opening funds, exposure and realized profit', () => {
   let l = applyEvent(ledger(), parseEvent(placed()), now);
@@ -141,8 +148,9 @@ test('balance reports cannot reset consumed caps or bankrolls after settlement a
   assert.throws(() => applyEvent(l, parseEvent(event), now), /balance_baseline_budget_consumed/);
   l = applyEvent(l, parseEvent({ ...event, establishDayBaseline: false }), now);
   assert.equal(b(l, 'fliff').day.spentCents, 300); assert.equal(b(l, 'fliff').day.bankrollCents, 10_000);
-  const again = placed('fliff', 100); if (again.type !== 'place') return; again.ticket.id = 'ticket.2';
-  assert.throws(() => applyEvent(l, parseEvent(again), now), /daily_limit_exceeded/);
+  const card = ready(); card.status = 'research'; card.proposedStakeCents = 0; card.returnCents = null; card.profitCents = null; card.decimalOdds = 2.25; card.plannedStakeCents = 100;
+  card.selections = [selection('Home', 1.5), selection('Away', 1.5)];
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'fliff.cap.plan', cards: [{ book: 'fliff', card }] }), now), /daily_limit_exceeded/);
   const next = new Date('2026-06-11T15:00:00Z');
   l = applyEvent(l, parseEvent({ ...settle('won', 675), book: 'fliff', occurredAt: next.toISOString() }), next);
   assert.equal(b(l, 'fliff').day.spentCents, 0);
@@ -192,6 +200,175 @@ test('target pauses new proposals and old cards lose actionable status', () => {
   const active = applyCards(ledger(), parseCards({ idempotencyKey: 'active', cards: [{ book: 'rebet', card: ready() }] }), now);
   const stale = visibleState(active, new Date(now.getTime() + 16 * 60_000)).books.find((x) => x.id === 'rebet')!.card!;
   assert.equal(stale.status, 'research'); assert.equal(stale.proposedStakeCents, 0);
+});
+test('correct_place supersede and reinsert does not double-count day spend or available cash', () => {
+  const event = placed('rebet', 1000); if (event.type !== 'place') return; event.ticket.feesCents = 25;
+  let l = applyEvent(ledger(), parseEvent(event), now);
+  assert.equal(b(l).availableCents, 8975); assert.equal(b(l).day.spentCents, 1025); assert.equal(b(l).day.stakedCents, 1000); assert.equal(b(l).realizedProfitCents, 0);
+  l = applyEvent(l, parseEvent({
+    idempotencyKey: 'correct.rebet.same', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Replace the recorded slip with the same stake', placementConfirmed: true, relatedEventId: 'placed.1', supersede: ['ticket.1'], targetCents: 60_000,
+    tickets: [{ id: 'ticket.1', stakeCents: 1000, feesCents: 25, decimalOdds: 1.21, selections: [selection(), selection('Away')], tier: 1, placedAt: iso }],
+  }), now);
+  assert.equal(b(l).availableCents, 8975); assert.equal(b(l).outstandingCents, 1000); assert.equal(b(l).day.spentCents, 1025); assert.equal(b(l).day.stakedCents, 1000);
+  assert.equal(b(l).realizedProfitCents, 0); assert.equal(b(l).targetCents, 60_000); assert.equal(b(l).tickets.length, 1); assert.equal(b(l).tickets[0].id, 'ticket.1');
+  assert.equal(b(l).tickets[0].status, 'open'); assert.equal(b(l).tickets[0].returnCents, null); assert.equal(b(l).tickets[0].placedAt, iso);
+});
+test('confirmed placement above the daily cap succeeds when cash, minimum stake, and target allow it', () => {
+  let l = applyEvent(ledger(), parseEvent(placed('fliff', 300)), now);
+  const extra = placed('fliff', 200); if (extra.type !== 'place') return; extra.ticket.id = 'ticket.overcap'; extra.idempotencyKey = 'placed.overcap';
+  l = applyEvent(l, parseEvent(extra), now);
+  assert.equal(b(l, 'fliff').availableCents, 9500); assert.equal(b(l, 'fliff').day.spentCents, 500); assert.equal(b(l, 'fliff').outstandingCents, 500);
+  l = applyEvent(l, parseEvent({
+    idempotencyKey: 'correct.fliff.overcap', type: 'correct_place', book: 'fliff', occurredAt: iso, note: 'Confirmed slip above the research cap', placementConfirmed: true,
+    tickets: [{ id: 'ticket.correct.overcap', stakeCents: 200, feesCents: 0, decimalOdds: 2.25, selections: [selection('Home', 1.5), selection('Away', 1.5)], tier: 1 }],
+  }), now);
+  assert.equal(b(l, 'fliff').availableCents, 9300); assert.equal(b(l, 'fliff').day.spentCents, 700);
+});
+test('planned stake and ready card still fail the cap and the Polymarket 25% floor', () => {
+  const readyOverCap = ready(); readyOverCap.proposedStakeCents = 301; readyOverCap.decimalOdds = 2.25; readyOverCap.returnCents = 677; readyOverCap.profitCents = 376;
+  readyOverCap.selections = [selection('Home', 1.5), selection('Away', 1.5)];
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'fliff.ready.cap', cards: [{ book: 'fliff', card: readyOverCap }] }), now), /daily_limit_exceeded/);
+  const plannedOverCap = { ...readyOverCap, status: 'research' as const, proposedStakeCents: 0, returnCents: null, profitCents: null, plannedStakeCents: 301 };
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'fliff.plan.cap', cards: [{ book: 'fliff', card: plannedOverCap }] }), now), /daily_limit_exceeded/);
+  const small = ready(); small.proposedStakeCents = 2000; small.returnCents = 2420; small.profitCents = 420;
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'pm.ready.floor', cards: [{ book: 'polymarket', card: small }] }), now), /below_minimum_allocation/);
+  const plannedSmall = { ...small, status: 'research' as const, proposedStakeCents: 0, returnCents: null, profitCents: null, plannedStakeCents: 2000 };
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'pm.plan.floor', cards: [{ book: 'polymarket', card: plannedSmall }] }), now), /below_minimum_allocation/);
+});
+test('void restores cash and leaves the placement day spend in place', () => {
+  let l = applyEvent(ledger(), parseEvent(placed('fliff', 300)), now);
+  l = applyEvent(l, parseEvent({ ...settle('void', 300), book: 'fliff' }), now);
+  assert.equal(b(l, 'fliff').availableCents, 10_000); assert.equal(b(l, 'fliff').outstandingCents, 0); assert.equal(b(l, 'fliff').realizedProfitCents, 0);
+  assert.equal(b(l, 'fliff').day.spentCents, 300); assert.equal(b(l, 'fliff').day.stakedCents, 300);
+});
+test('correct_place accepts out-of-range decimal odds and null leg odds', () => {
+  const recorded = applyEvent(ledger(), parseEvent({
+    idempotencyKey: 'correct.rebet.odds', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Slip price sits outside the research range', placementConfirmed: true,
+    tickets: [{ id: 'ticket.wide', stakeCents: 100, feesCents: 0, decimalOdds: 9, selections: [{ ...selection('Home'), odds: null }], tier: 1 }],
+  }), now);
+  assert.equal(b(recorded).tickets[0].decimalOdds, 9); assert.equal(b(recorded).tickets[0].selections[0].odds, null);
+  assert.equal(b(recorded).tickets[0].placedAt, iso); assert.equal(b(recorded).tickets[0].status, 'open'); assert.equal(b(recorded).tickets[0].returnCents, null);
+  assert.equal(b(recorded).availableCents, 9900);
+});
+test('corrected placement timestamps cannot be future or predate the ledger', () => {
+  const original = applyEvent(ledger(), parseEvent(placed()), now);
+  const event = {
+    idempotencyKey: 'correct.timestamp', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Correct the recorded placement time', placementConfirmed: true, supersede: ['ticket.1'],
+    tickets: [{ id: 'ticket.1', stakeCents: 1000, feesCents: 0, decimalOdds: 1.21, selections: [selection(), selection('Away')], tier: 1, placedAt: new Date(now.getTime() + 1).toISOString() }],
+  };
+  assert.throws(() => applyEvent(original, parseEvent(event), now), /future_placement/);
+  event.tickets[0].placedAt = '2026-06-10T13:59:00.000Z';
+  assert.throws(() => applyEvent(original, parseEvent(event), now), /placement_before_ledger_start/);
+  assert.equal(b(original).availableCents, 9000); assert.equal(b(original).tickets[0].placedAt, iso);
+});
+test('missing exchange fills fail on correct_place', () => {
+  const ticket = { id: 'ticket.x', stakeCents: 100, feesCents: 0, decimalOdds: 2, selections: [selection('Home', 2)], tier: 1 as const };
+  for (const book of ['polymarket', 'novig', 'novig_credit'] as const) {
+    assert.throws(() => parseEvent({ idempotencyKey: `correct.${book}.nofill`, type: 'correct_place', book, occurredAt: iso, note: 'No fills', placementConfirmed: true, tickets: [ticket] }), /exchange_fills_required/);
+  }
+});
+test('the same ticket id can return after supersede', () => {
+  let l = applyEvent(ledger(), parseEvent(placed('rebet', 1000)), now);
+  l = applyEvent(l, parseEvent({
+    idempotencyKey: 'correct.rebet.return', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Reinsert the same id', placementConfirmed: true, supersede: ['ticket.1'],
+    tickets: [{ id: 'ticket.1', stakeCents: 800, feesCents: 0, decimalOdds: 1.21, selections: [selection(), selection('Away')], tier: 1, placedAt: iso }],
+  }), now);
+  assert.equal(b(l).tickets.length, 1); assert.equal(b(l).tickets[0].id, 'ticket.1'); assert.equal(b(l).tickets[0].stakeCents, 800); assert.equal(b(l).availableCents, 9200); assert.equal(b(l).day.spentCents, 800);
+  assert.throws(() => applyEvent(l, parseEvent({
+    idempotencyKey: 'correct.rebet.dup', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Id still open', placementConfirmed: true,
+    tickets: [{ id: 'ticket.1', stakeCents: 100, feesCents: 0, decimalOdds: 1.21, selections: [selection(), selection('Away')], tier: 1 }],
+  }), now), /ticket_exists/);
+});
+test('a settled ticket cannot be superseded', () => {
+  let l = applyEvent(ledger(), parseEvent(placed()), now);
+  l = applyEvent(l, parseEvent(settle()), now);
+  assert.throws(() => applyEvent(l, parseEvent({
+    idempotencyKey: 'correct.rebet.settled', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Settled tickets stay put', placementConfirmed: true, supersede: ['ticket.1'],
+    tickets: [{ id: 'ticket.1', stakeCents: 1000, feesCents: 0, decimalOdds: 1.21, selections: [selection(), selection('Away')], tier: 1 }],
+  }), now), /ticket_closed/);
+});
+test('a playthrough book at its target can still take a stake up to the target sum', () => {
+  const paused = ledger(); b(paused).availableCents = b(paused).targetCents;
+  assert.throws(() => applyEvent(paused, parseEvent(placed()), now), /target_reached/);
+  const credit = (stake: number, id: string, key: string) => ({ idempotencyKey: key, type: 'place' as const, book: 'novig_credit' as const, occurredAt: iso, note: 'Confirmed playthrough slip', placementConfirmed: true as const, ticket: { id, stakeCents: stake, feesCents: 0, decimalOdds: 2, selections: [selection('Home', 2)], tier: 1 as const, fills: [{ id: `fill.${id}`, quantity: stake / 50, priceCents: 50 }] } });
+  assert.equal(b(ledger(), 'novig_credit').availableCents, b(ledger(), 'novig_credit').targetCents);
+  let l = applyEvent(ledger(), parseEvent(credit(600, 'credit.1', 'place.credit.1')), now);
+  assert.equal(b(l, 'novig_credit').availableCents, 400); assert.equal(b(l, 'novig_credit').outstandingCents, 600);
+  l = applyEvent(l, parseEvent({ idempotencyKey: 'deposit.credit', type: 'adjust', book: 'novig_credit', occurredAt: iso, note: 'Test funds', kind: 'deposit', amountCents: 1000 }), now);
+  assert.throws(() => applyEvent(l, parseEvent(credit(500, 'credit.2', 'place.credit.2')), now), /target_reached/);
+  l = applyEvent(l, parseEvent(credit(400, 'credit.3', 'place.credit.3')), now);
+  assert.equal(b(l, 'novig_credit').outstandingCents, 1000);
+  assert.equal(b(l, 'novig_credit').tickets.reduce((sum, ticket) => sum + ticket.stakeCents, 0), 1000);
+});
+function creditProposalLedger() {
+  const l = ledger(); const credit = b(l, 'novig_credit');
+  credit.openingCents = 2500; credit.availableCents = 2500; credit.targetCents = 2500; credit.day.bankrollCents = 2500;
+  credit.policy.maxLegImpliedProbability = .6;
+  return l;
+}
+function creditProposal(status: 'ready' | 'research', stakeCents: number): Card {
+  return { ...ready(), status, proposedStakeCents: status === 'ready' ? stakeCents : 0, ...(status === 'research' ? { plannedStakeCents: stakeCents } : {}), decimalOdds: 2, returnCents: status === 'ready' ? stakeCents * 2 : null, profitCents: status === 'ready' ? stakeCents : null, selections: [selection('Credit fixture', 2)] };
+}
+function publishCredit(l: Ledger, card: Card) {
+  return applyCards(l, parseCards({ idempotencyKey: 'credit.card', cards: [{ book: 'novig_credit', card }] }), now);
+}
+function partialCreditPlacement(l: Ledger) {
+  return applyEvent(l, parseEvent({ idempotencyKey: 'credit.partial', type: 'place', book: 'novig_credit', occurredAt: iso, note: 'Confirmed synthetic credit fill', placementConfirmed: true, ticket: { id: 'credit.partial', stakeCents: 1500, feesCents: 0, decimalOdds: 2, selections: [selection('Credit fixture', 2)], tier: 1, fills: [{ id: 'credit.partial.fill', quantity: 30, priceCents: 50 }] } }), now);
+}
+test('ready and planned credit cards can use an untouched playthrough balance equal to its requirement', () => {
+  for (const status of ['ready', 'research'] as const) {
+    const l = publishCredit(creditProposalLedger(), creditProposal(status, 2500)); const credit = b(l, 'novig_credit');
+    assert.equal(credit.card!.status, status); assert.equal(credit.availableCents, 2500); assert.equal(credit.outstandingCents, 0); assert.equal(credit.day.spentCents, 0);
+    assert.equal(status === 'ready' ? credit.card!.proposedStakeCents : credit.card!.plannedStakeCents, 2500);
+  }
+});
+test('credit cards cannot overshoot remaining playthrough even when extra cash is available', () => {
+  let l = partialCreditPlacement(creditProposalLedger());
+  l = applyEvent(l, parseEvent({ idempotencyKey: 'credit.extra', type: 'adjust', book: 'novig_credit', occurredAt: iso, note: 'Synthetic additional funds', kind: 'deposit', amountCents: 2000 }), now);
+  for (const status of ['ready', 'research'] as const) {
+    assert.throws(() => publishCredit(l, creditProposal(status, 1001)), /target_reached/);
+    assert.equal(b(publishCredit(l, creditProposal(status, 1000)), 'novig_credit').card!.status, status);
+  }
+});
+test('credit proposals retain configured price limits, daily caps, fee accounting and available-cash guards', () => {
+  for (const status of ['ready', 'research'] as const) {
+    const tooExpensive = creditProposal(status, 500); tooExpensive.decimalOdds = 1.5;
+    assert.throws(() => publishCredit(creditProposalLedger(), tooExpensive), /leg_price_outside_range/);
+    tooExpensive.decimalOdds = 2; tooExpensive.selections[0].odds = 1.5;
+    assert.throws(() => publishCredit(creditProposalLedger(), tooExpensive), /leg_price_outside_range/);
+    const capped = creditProposalLedger(); b(capped, 'novig_credit').policy.dailyCapCents = 400;
+    assert.throws(() => publishCredit(capped, creditProposal(status, 500)), /daily_limit_exceeded/);
+    const allInWithFee = creditProposal(status, 2500); allInWithFee.feesCents = 1;
+    assert.throws(() => publishCredit(creditProposalLedger(), allInWithFee), /daily_limit_exceeded/);
+    const short = creditProposalLedger(); b(short, 'novig_credit').availableCents = 250;
+    assert.throws(() => publishCredit(short, creditProposal(status, 500)), /daily_limit_exceeded/);
+  }
+});
+test('void credit stakes restore unfulfilled playthrough but do not recycle the same-day budget', () => {
+  let l = partialCreditPlacement(creditProposalLedger());
+  l = applyEvent(l, parseEvent({ ...settle('void', 1500), idempotencyKey: 'credit.void', book: 'novig_credit', ticketId: 'credit.partial' }), now);
+  for (const status of ['ready', 'research'] as const) {
+    assert.throws(() => publishCredit(l, creditProposal(status, 1001)), /daily_limit_exceeded/);
+    assert.equal(b(publishCredit(l, creditProposal(status, 1000)), 'novig_credit').card!.status, status);
+  }
+});
+test('empty correct_place fails', () => {
+  assert.throws(() => parseEvent({ idempotencyKey: 'correct.empty', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Nothing to change', placementConfirmed: true }), /empty_correction/);
+  assert.throws(() => parseEvent({ idempotencyKey: 'correct.empty.lists', type: 'correct_place', book: 'rebet', occurredAt: iso, note: 'Empty lists', placementConfirmed: true, supersede: [], tickets: [] }), /empty_correction/);
+});
+test('credit usage history is never pruned to reopen a completed allowance', () => {
+  const l = ledger(); const credit = b(l, 'novig_credit');
+  credit.tickets = Array.from({ length: 50 }, (_, i) => ({ id: `prior.${i}`, book: 'novig_credit', status: 'won', placedAt: iso, settledAt: iso, stakeCents: 1, feesCents: 0, returnCents: 2, decimalOdds: 2, selections: [selection('Home', 2)] }));
+  const event = placed('novig_credit', 100); if (event.type !== 'place') return;
+  event.ticket.selections = [selection('Home', 2)]; event.ticket.decimalOdds = 2;
+  event.ticket.fills = [{ id: 'fill.new', quantity: 2, priceCents: 50 }];
+  assert.throws(() => applyEvent(l, parseEvent(event), now), /playthrough_history_reconciliation_required/);
+  assert.equal(credit.tickets.length, 50); assert.equal(credit.availableCents, 1000);
+});
+test('cards accept the active books including novig credit', () => {
+  const card = { date: '2026-06-10', status: 'skip' as const, summary: 'No bet', updatedAt: iso, tier: null, proposedStakeCents: 0, decimalOdds: null, returnCents: null, profitCents: null, selections: [], sources: [], invalidations: ['No bet'] };
+  const cards = ['polymarket', 'fliff', 'rebet', 'novig', 'underdog', 'underdog_streaks', 'novig_credit'].map((book) => ({ book, card }));
+  assert.equal(parseCards({ idempotencyKey: 'cards.seven', cards }).cards.length, 7);
 });
 test('Central calendar dates remain correct across DST transitions', () => {
   assert.equal(centralDay(new Date('2026-03-08T05:59:00Z')), '2026-03-07');

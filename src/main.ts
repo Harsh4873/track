@@ -251,22 +251,22 @@ function renderBook(book: BookState) {
   panel.setAttribute('role', 'tabpanel');
   panel.setAttribute('aria-labelledby', `tab-${book.id}`);
   panel.tabIndex = 0;
-  const equity = book.availableCents;
-  const pct = progress(book.availableCents, 0, book.targetCents);
-  const balance = el('section', 'balance-panel', el('div', 'balance-main', text('p', 'Available', 'eyebrow'), text('p', money(book.availableCents), 'balance-value')));
+  const playthroughCredit = book.playthrough === true;
+  const equity = playthroughCredit ? book.tickets.reduce((sum, ticket) => sum + (ticket.status === 'void' ? 0 : ticket.stakeCents), 0) : book.availableCents;
+  const pct = progress(equity, 0, book.targetCents);
+  const balance = el('section', 'balance-panel', el('div', 'balance-main', text('p', playthroughCredit ? 'Available credit' : 'Available', 'eyebrow'), text('p', money(book.availableCents), 'balance-value')));
   const metric = (label: string, value: string, tone = '') => el('div', `metric ${tone}`, text('p', label, 'metric-label'), text('p', value, 'metric-value'));
   balance.append(el('div', 'balance-metrics', metric('Outstanding', money(book.outstandingCents)), metric('Realized P&L', signedMoney(book.realizedProfitCents), book.realizedProfitCents > 0 ? 'positive' : book.realizedProfitCents < 0 ? 'negative' : ''), metric('Staked today', money(book.dailyStakedCents))));
   const progressBar = el('div', 'goal-bar', el('span', 'goal-fill'));
   (progressBar.firstElementChild as HTMLElement).style.width = `${pct}%`;
   progressBar.setAttribute('role', 'progressbar');
-  progressBar.setAttribute('aria-label', 'Progress toward growth goal');
+  progressBar.setAttribute('aria-label', playthroughCredit ? 'Recorded credit usage' : 'Progress toward growth goal');
   progressBar.setAttribute('aria-valuemin', '0');
   progressBar.setAttribute('aria-valuemax', '100');
   progressBar.setAttribute('aria-valuenow', pct.toFixed(1));
-  progressBar.setAttribute('aria-valuetext', `${money(equity)} available toward ${money(book.targetCents)}`);
-  const playthroughCredit = book.name === 'Novig Credit';
-  const goal = el('div', 'goal-row', el('div', 'goal-copy', text('span', 'Growth', 'metric-label'), text('span', `${money(equity)} / ${money(book.targetCents)}`, 'goal-amount')), progressBar);
-  if (playthroughCredit) goal.append(text('span', 'Playthrough, not cash.', 'goal-caption'));
+  progressBar.setAttribute('aria-valuetext', `${money(equity)} ${playthroughCredit ? 'recorded usage' : 'available'} toward ${money(book.targetCents)}`);
+  const goal = el('div', 'goal-row', el('div', 'goal-copy', text('span', playthroughCredit ? 'Credit used' : 'Growth', 'metric-label'), text('span', `${money(equity)} / ${money(book.targetCents)}`, 'goal-amount')), progressBar);
+  if (playthroughCredit) goal.append(text('span', 'Withdrawal eligibility requires app confirmation.', 'goal-caption'));
   balance.append(goal);
   panel.append(balance);
   const pending = book.tickets.filter((ticket) => ticket.status === 'result_pending').length;
@@ -286,7 +286,7 @@ function renderCard(card: Card | null) {
     return section;
   }
   const planned = card.status === 'research' && card.plannedStakeCents ? card.plannedStakeCents : null;
-  const labels = { ready: 'Open', skip: 'Skip', research: 'Check' };
+  const labels = { ready: 'Proposed', skip: 'Skip', research: 'Check' };
   const status = labels[card.status] || 'Check';
   section.append(sectionHeader('Card', calendarDate(card.date), text('span', status, `status-badge status-${card.status}`)));
   if (card.summary) section.append(text('p', card.summary, 'card-lead'));
@@ -300,7 +300,7 @@ function renderCard(card: Card | null) {
   if (planned) {
     const estimate = card.decimalOdds === null ? null : Math.round(planned * card.decimalOdds);
     section.append(el('div', 'quote-grid', detail('Planned stake', money(planned)), detail('Est. total return', estimate === null ? 'See app' : money(estimate)), detail('Est. profit', estimate === null ? 'See app' : signedMoney(estimate - planned)), detail('Est. multiple', card.decimalOdds === null ? 'See app' : `${card.decimalOdds.toFixed(2)}×`)));
-    section.append(text('p', 'Comparison estimate. The app price decides.', 'fine-print plan-note'));
+    section.append(text('p', 'Estimate. Check the current app price and eligibility before placing.', 'fine-print plan-note'));
   }
   if (card.status === 'ready') {
     section.append(el('div', 'quote-grid', detail('Proposed stake', money(card.proposedStakeCents)), detail('Total return', card.returnCents === null ? 'Unconfirmed' : money(card.returnCents)), detail('Potential profit', card.profitCents === null ? 'Unconfirmed' : signedMoney(card.profitCents)), detail('Return multiple', card.decimalOdds === null ? 'Unconfirmed' : `${card.decimalOdds.toFixed(2)}×`)));

@@ -6,7 +6,8 @@ export class ApiError extends Error {
 }
 
 const MAX_CENTS = 100_000_000;
-const EXCHANGE_BOOKS: readonly BookId[] = ['polymarket', 'novig'];
+const EXCHANGE_BOOKS: readonly BookId[] = ['polymarket', 'novig', 'novig_credit'];
+const SINGLE_SELECTION_BOOKS = ['novig', 'novig_credit', 'underdog_streaks'];
 const DAY_FORMAT = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' });
 export function centralDay(now: Date): string { return DAY_FORMAT.format(now); }
 export function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex'); }
@@ -60,11 +61,12 @@ function validatePolicy(value: unknown, id: BookId): asserts value is BookPolicy
   if (value.minReturn !== null) number(value.minReturn, 1.0001, 1000);
   if (value.maxReturn !== null) number(value.maxReturn, 1.0001, 1000);
   ensure(value.minReturn === null || value.maxReturn === null || (value.minReturn as number) <= (value.maxReturn as number));
-  integer(value.minSelections); ensure(value.minSelections >= (['novig', 'underdog_streaks'].includes(id) ? 1 : 2) && value.minSelections <= 12);
+  integer(value.minSelections); ensure(value.minSelections >= (SINGLE_SELECTION_BOOKS.includes(id) ? 1 : 2) && value.minSelections <= 12);
   if (value.minLegImpliedProbability !== null) number(value.minLegImpliedProbability, 0.001, 0.999);
   if (value.maxLegImpliedProbability !== null) number(value.maxLegImpliedProbability, 0.001, 0.999);
   ensure(value.minLegImpliedProbability === null || value.maxLegImpliedProbability === null || (value.minLegImpliedProbability as number) <= (value.maxLegImpliedProbability as number));
   number(value.quoteMaxAgeMinutes, 1, 120);
+  if (value.playthrough !== undefined) ensure(typeof value.playthrough === 'boolean');
 }
 
 export function parseBootstrap(value: unknown): BootstrapRequest {
@@ -110,13 +112,38 @@ export function parseEvent(value: unknown): LedgerEvent {
       text(value.name, 60); integer(value.openingCents); integer(value.targetCents); ensure(value.targetCents > 0);
       validatePolicy(value.policy, value.book); ensure(ACTIVE_BOOK_IDS.includes(value.book as typeof ACTIVE_BOOK_IDS[number]), 'inactive_book');
       break;
+    case 'correct_place': {
+      ensure(value.placementConfirmed === true, 'placement_confirmation_required');
+      if (value.relatedEventId !== undefined) key(value.relatedEventId);
+      if (value.targetCents !== undefined) { integer(value.targetCents); ensure(value.targetCents > 0); }
+      if (value.supersede !== undefined) {
+        array(value.supersede, 50); value.supersede.forEach((id) => key(id));
+        ensure(new Set(value.supersede as string[]).size === value.supersede.length, 'duplicate_ticket');
+      }
+      if (value.tickets !== undefined) {
+        array(value.tickets, 20);
+        const ids = new Set<string>();
+        for (const ticket of value.tickets) {
+          object(ticket); key(ticket.id); ensure(!ids.has(ticket.id as string)); ids.add(ticket.id as string);
+          integer(ticket.stakeCents); ensure(ticket.stakeCents > 0); integer(ticket.feesCents);
+          nullableOdds(ticket.decimalOdds); validateSelections(ticket.selections); tier(ticket.tier);
+          if (ticket.fills !== undefined) validateFills(ticket.fills);
+          if (EXCHANGE_BOOKS.includes(value.book)) ensure(ticket.fills !== undefined, 'exchange_fills_required');
+          if (ticket.placedAt !== undefined) timestamp(ticket.placedAt);
+        }
+      }
+      const supersedeCount = Array.isArray(value.supersede) ? value.supersede.length : 0;
+      const ticketCount = Array.isArray(value.tickets) ? value.tickets.length : 0;
+      ensure(supersedeCount > 0 || ticketCount > 0 || value.targetCents !== undefined, 'empty_correction');
+      break;
+    }
     default: throw new ApiError(400, 'invalid_event');
   }
   return value as unknown as LedgerEvent;
 }
 
 export function parseCards(value: unknown): PublishCardsRequest {
-  object(value); key(value.idempotencyKey); array(value.cards, 6); ensure(value.cards.length > 0);
+  object(value); key(value.idempotencyKey); array(value.cards, 8); ensure(value.cards.length > 0);
   const ids = new Set<string>();
   for (const entry of value.cards) {
     object(entry); bookId(entry.book); ensure(!ids.has(entry.book)); ids.add(entry.book); object(entry.card);
@@ -168,10 +195,44 @@ function stakeLimit(book: InternalBook): number {
 
 function validateStake(book: InternalBook, stakeCents: number, feesCents: number, initial = true): void {
   const cost = stakeCents + feesCents;
-  ensure(book.availableCents < book.targetCents, 'target_reached', 409);
+  validateTargetStake(book, stakeCents);
   ensure(!initial || stakeCents >= book.policy.minStakeCents, 'below_minimum_stake');
   ensure(cost <= stakeLimit(book), 'daily_limit_exceeded', 409);
   ensure(!initial || cost >= Math.ceil(book.day.bankrollCents * book.policy.minimumBankrollFraction), 'below_minimum_allocation');
+}
+
+function nonVoidStakeCents(book: InternalBook): number {
+  return book.tickets.reduce((sum, ticket) => sum + (ticket.status === 'void' ? 0 : ticket.stakeCents), 0);
+}
+
+function validateTargetStake(book: InternalBook, stakeCents: number): void {
+  if (book.policy.playthrough) ensure(nonVoidStakeCents(book) + stakeCents <= book.targetCents, 'target_reached', 409);
+  else ensure(book.availableCents < book.targetCents, 'target_reached', 409);
+}
+
+// Confirmed slips record cash actually staked. The research cap and Polymarket floor stay on cards, planned stakes, and fills.
+function validateConfirmedPlacement(book: InternalBook, stakeCents: number, feesCents: number): void {
+  const cost = stakeCents + feesCents;
+  ensure(book.availableCents >= cost, 'insufficient_balance', 409);
+  ensure(stakeCents >= book.policy.minStakeCents, 'below_minimum_stake');
+  validateTargetStake(book, stakeCents);
+}
+
+function dayBudget(book: InternalBook, at: string): DayBudget {
+  const date = centralDay(new Date(at));
+  const budget = date === book.day.date ? book.day : book.budgets?.[date];
+  ensure(budget, 'historical_day_requires_reconciliation', 409);
+  return budget;
+}
+
+// Keep the Firestore state document bounded; the event journal retains every ticket.
+function makeRoom(book: InternalBook): void {
+  while (book.tickets.length >= 50) {
+    ensure(!book.policy.playthrough, 'playthrough_history_reconciliation_required', 409);
+    const index = book.tickets.findIndex((ticket) => !isOpen(ticket));
+    ensure(index >= 0, 'too_many_open_tickets', 409);
+    book.tickets.splice(index, 1);
+  }
 }
 
 function validateMarket(book: InternalBook, selections: Selection[], decimalOdds: number | null, requirePrice = true): void {
@@ -179,6 +240,7 @@ function validateMarket(book: InternalBook, selections: Selection[], decimalOdds
   ensure(decimalOdds !== null || !requirePrice, 'accepted_price_required');
   if (decimalOdds !== null && book.policy.minReturn !== null) ensure(decimalOdds + 1e-8 >= book.policy.minReturn, 'return_outside_range');
   if (decimalOdds !== null && book.policy.maxReturn !== null) ensure(decimalOdds - 1e-8 <= book.policy.maxReturn, 'return_outside_range');
+  if (book.policy.playthrough && decimalOdds !== null && book.policy.maxLegImpliedProbability !== null) ensure(1 / decimalOdds - 1e-8 <= book.policy.maxLegImpliedProbability, 'leg_price_outside_range');
   for (const selection of selections) {
     if (book.policy.minLegImpliedProbability !== null || book.policy.maxLegImpliedProbability !== null) {
       ensure(selection.odds !== null, 'leg_price_required');
@@ -250,13 +312,51 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
   switch (event.type) {
     case 'place': {
       ensure(!book.tickets.some((ticket) => ticket.id === event.ticket.id), 'ticket_exists', 409);
-      // Keep the Firestore state document bounded; the event journal retains every ticket.
-      while (book.tickets.length >= 50) { const index = book.tickets.findIndex((ticket) => !isOpen(ticket)); ensure(index >= 0, 'too_many_open_tickets', 409); book.tickets.splice(index, 1); }
-      validateStake(book, event.ticket.stakeCents, event.ticket.feesCents);
+      makeRoom(book);
+      validateConfirmedPlacement(book, event.ticket.stakeCents, event.ticket.feesCents);
       if (event.ticket.fills) ensure(fillCost(event.ticket.fills) === event.ticket.stakeCents, 'fill_cost_mismatch');
       const ticket: Ticket = { ...event.ticket, book: book.id, status: 'open', placedAt: event.occurredAt, returnCents: null };
       book.tickets.push(ticket); book.availableCents -= ticket.stakeCents + ticket.feesCents; book.outstandingCents += ticket.stakeCents;
       book.day.spentCents += ticket.stakeCents + ticket.feesCents; book.day.stakedCents += ticket.stakeCents;
+      break;
+    }
+    case 'correct_place': {
+      const supersedeCount = event.supersede?.length ?? 0;
+      const incoming = event.tickets ?? [];
+      ensure(supersedeCount > 0 || incoming.length > 0 || event.targetCents !== undefined, 'empty_correction');
+      if (event.targetCents !== undefined) book.targetCents = event.targetCents;
+      for (const id of event.supersede ?? []) {
+        const ticket = findTicket(book, id);
+        ensure(isOpen(ticket), 'ticket_closed', 409);
+        const budget = dayBudget(book, ticket.placedAt);
+        const cost = ticket.stakeCents + ticket.feesCents;
+        ensure(budget.spentCents >= cost && budget.stakedCents >= ticket.stakeCents, 'negative_day_spend', 409);
+        book.availableCents += cost;
+        book.outstandingCents -= ticket.stakeCents;
+        budget.spentCents -= cost;
+        budget.stakedCents -= ticket.stakeCents;
+        book.tickets.splice(book.tickets.findIndex((item) => item.id === id), 1);
+      }
+      for (const ticketInput of incoming) {
+        const placedAt = ticketInput.placedAt ?? event.occurredAt;
+        ensure(Date.parse(placedAt) <= now.getTime(), 'future_placement');
+        ensure(Date.parse(placedAt) >= Date.parse(ledger.ledgerStart), 'placement_before_ledger_start');
+        ensure(!book.tickets.some((ticket) => ticket.id === ticketInput.id), 'ticket_exists', 409);
+        makeRoom(book);
+        validateConfirmedPlacement(book, ticketInput.stakeCents, ticketInput.feesCents);
+        if (ticketInput.fills) ensure(fillCost(ticketInput.fills) === ticketInput.stakeCents, 'fill_cost_mismatch');
+        const budget = dayBudget(book, placedAt);
+        const ticket: Ticket = {
+          id: ticketInput.id, book: book.id, status: 'open', placedAt, stakeCents: ticketInput.stakeCents, feesCents: ticketInput.feesCents,
+          returnCents: null, decimalOdds: ticketInput.decimalOdds, selections: ticketInput.selections, tier: ticketInput.tier,
+          ...(ticketInput.fills ? { fills: ticketInput.fills } : {}),
+        };
+        book.tickets.push(ticket);
+        book.availableCents -= ticket.stakeCents + ticket.feesCents;
+        book.outstandingCents += ticket.stakeCents;
+        budget.spentCents += ticket.stakeCents + ticket.feesCents;
+        budget.stakedCents += ticket.stakeCents;
+      }
       break;
     }
     case 'fill': {
@@ -323,8 +423,7 @@ export function applyCards(previous: Ledger, input: PublishCardsRequest, now: Da
     ensure(entry.card.date === centralDay(now), 'card_day_mismatch');
     if (entry.card.status === 'ready') validateReadyCard(book, entry.card, now);
     if (entry.card.plannedStakeCents !== undefined) {
-      ensure(book.availableCents < book.targetCents, 'target_reached', 409);
-      ensure(entry.card.plannedStakeCents <= stakeLimit(book), 'daily_limit_exceeded', 409);
+      validateStake(book, entry.card.plannedStakeCents, entry.card.feesCents ?? 0);
       validateMarket(book, entry.card.selections, entry.card.decimalOdds, false);
     }
     book.card = { ...entry.card, updatedAt: now.toISOString() };
@@ -336,6 +435,7 @@ export function visibleState(ledger: Ledger | null, now: Date): TrackState {
   if (!ledger) return { updatedAt: null, ledgerStart: null, books: [] };
   return { updatedAt: ledger.updatedAt, ledgerStart: ledger.ledgerStart, books: ledger.books.filter((internal) => !internal.retired).map((internal) => {
     const { policy, day, budgets, retired, ...book } = structuredClone(internal); book.dailyStakedCents = day.date === centralDay(now) ? day.stakedCents : 0;
+    if (policy.playthrough) book.playthrough = true;
     if (book.card?.status === 'ready') {
       const stale = book.card.date !== centralDay(now) || book.card.selections.some((selection) => Date.parse(selection.startTime) <= now.getTime() || now.getTime() - Date.parse(selection.quotedAt) > policy.quoteMaxAgeMinutes * 60_000);
       if (stale) book.card = { ...book.card, status: 'research', proposedStakeCents: 0, returnCents: null, profitCents: null, summary: `Recheck required. ${book.card.summary}` };
