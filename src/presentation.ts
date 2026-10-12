@@ -10,7 +10,7 @@ const shortDate = new Intl.DateTimeFormat('en-US', {
 });
 
 export function money(cents: number): string {
-  return Number.isFinite(cents) ? dollars.format(cents / 100) : '—';
+  return Number.isFinite(cents) ? dollars.format(cents / 100) : 'n/a';
 }
 
 export function signedMoney(cents: number): string {
