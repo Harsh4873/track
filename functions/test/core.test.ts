@@ -62,6 +62,19 @@ test('Polymarket minimum allocation is 25%, not a maximum; full balance remains 
   event.ticket.stakeCents = 2000; event.ticket.fills = [{ id: 'fill.small', quantity: 25, priceCents: 80 }];
   assert.throws(() => applyEvent(ledger(), parseEvent(event), now), /below_minimum_allocation/);
 });
+test('Novig requires actual exchange fills and counts later fills and fees toward its cap', () => {
+  const event = placed('novig', 100); if (event.type !== 'place') return;
+  event.ticket.selections = [selection('Home', 2)]; event.ticket.decimalOdds = 2;
+  assert.throws(() => parseEvent(event), /exchange_fills_required/);
+  event.ticket.fills = [{ id: 'novig.1', quantity: 2, priceCents: 50 }];
+  let l = applyEvent(ledger(), parseEvent(event), now);
+  const extra = { idempotencyKey: 'novig.2', type: 'fill', book: 'novig', occurredAt: iso, note: 'Confirmed partial fill', placementConfirmed: true, ticketId: 'ticket.1', fills: [{ id: 'novig.2', quantity: 2, priceCents: 50 }], feesCents: 5 };
+  l = applyEvent(l, parseEvent(extra), now);
+  assert.equal(b(l, 'novig').availableCents, 9795); assert.equal(b(l, 'novig').outstandingCents, 200);
+  assert.throws(() => applyEvent(l, parseEvent({ ...extra, idempotencyKey: 'novig.3', fills: [{ id: 'novig.3', quantity: 2, priceCents: 50 }] }), now), /daily_limit_exceeded/);
+  l = applyEvent(l, parseEvent({ ...settle('won', 400), book: 'novig' }), now);
+  assert.equal(b(l, 'novig').availableCents, 10_195); assert.equal(b(l, 'novig').realizedProfitCents, 195);
+});
 test('parlays are required for the three allocation accounts and must stay in return range', () => {
   for (const book of ['rebet', 'onyx'] as const) {
     const event = placed(book); if (event.type !== 'place') continue;

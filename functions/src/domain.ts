@@ -6,6 +6,7 @@ export class ApiError extends Error {
 }
 
 const MAX_CENTS = 100_000_000;
+const EXCHANGE_BOOKS: readonly BookId[] = ['polymarket', 'novig'];
 const DAY_FORMAT = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit' });
 export function centralDay(now: Date): string { return DAY_FORMAT.format(now); }
 export function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex'); }
@@ -83,10 +84,10 @@ export function parseEvent(value: unknown): LedgerEvent {
       key(value.ticket.id); integer(value.ticket.stakeCents); ensure(value.ticket.stakeCents > 0); integer(value.ticket.feesCents);
       nullableOdds(value.ticket.decimalOdds); validateSelections(value.ticket.selections); tier(value.ticket.tier);
       if (value.ticket.fills !== undefined) validateFills(value.ticket.fills);
-      if (value.book === 'polymarket') ensure(value.ticket.fills !== undefined, 'exchange_fills_required');
+      if (EXCHANGE_BOOKS.includes(value.book)) ensure(value.ticket.fills !== undefined, 'exchange_fills_required');
       break;
     }
-    case 'fill': key(value.ticketId); ensure(value.placementConfirmed === true, 'placement_confirmation_required'); validateFills(value.fills); integer(value.feesCents); ensure(value.book === 'polymarket', 'not_exchange'); break;
+    case 'fill': key(value.ticketId); ensure(value.placementConfirmed === true, 'placement_confirmation_required'); validateFills(value.fills); integer(value.feesCents); ensure(EXCHANGE_BOOKS.includes(value.book), 'not_exchange'); break;
     case 'result': key(value.ticketId); text(value.resultNote, 2000); break;
     case 'settle':
     case 'correct_settlement':
