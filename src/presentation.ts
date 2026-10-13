@@ -46,6 +46,12 @@ export function americanOdds(decimal: number): string {
   return value > 0 ? `+${value}` : String(value);
 }
 
+export function priceLabel(odds: number | null): string {
+  if (odds === null) return 'Price unconfirmed';
+  if (!Number.isFinite(odds) || odds <= 1) return 'Unpriced';
+  return `${americanOdds(odds)} · ${(100 / odds).toFixed(1)}% implied`;
+}
+
 export function safeSourceUrl(value: string): string | null {
   try {
     const url = new URL(value);

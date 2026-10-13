@@ -4,10 +4,17 @@ import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 const source = await readFile('src/presentation.ts', 'utf8');
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
-const { money, safeSourceUrl, progress, calendarDate, age, americanOdds } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
+const { money, safeSourceUrl, progress, calendarDate, age, americanOdds, priceLabel } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
 test('leg prices show American odds for favorites, underdogs and invalid input', () => {
   assert.equal(americanOdds(1 / 0.96), '-2400'); assert.equal(americanOdds(1 + 100 / 174), '-174'); assert.equal(americanOdds(2.15), '+115');
   assert.equal(americanOdds(2), '+100'); assert.equal(americanOdds(1), 'Unpriced'); assert.equal(americanOdds(Number.NaN), 'Unpriced');
+});
+test('unpriceable legs do not invent an implied percent', () => {
+  assert.equal(priceLabel(null), 'Price unconfirmed');
+  assert.equal(priceLabel(Number.NaN), 'Unpriced');
+  assert.equal(priceLabel(0), 'Unpriced');
+  assert.equal(priceLabel(1), 'Unpriced');
+  assert.equal(priceLabel(2.15), '+115 · 46.5% implied');
 });
 test('display formats cents and growth progress without invalid percentages', () => { assert.equal(money(12345), '$123.45'); assert.equal(progress(100, 50, 1000), 15); assert.equal(progress(999, 999, 0), 0); });
 test('source links reject executable URLs and embedded credentials', () => { assert.equal(safeSourceUrl('javascript:alert(1)'), null); assert.equal(safeSourceUrl('https://user:pass@example.com'), null); assert.equal(safeSourceUrl('https://example.com'), 'https://example.com/'); });
@@ -118,4 +125,29 @@ test('light palette text meets WCAG AA contrast on its background', async () => 
   const ratio = (a, b) => { const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (high + 0.05) / (low + 0.05); };
   const pairs = { bg: 'text muted dim accent quiet-text field-label form-status motto sync-text empty-symbol', panel: 'text muted dim positive negative metric-label', 'detail-bg': 'text muted dim accent positive negative badge-text pending-text tier-text market-text small-heading link-hover empty-symbol ticket-status ticket-total', 'quote-bg': 'text muted', accent: 'on-accent mark-ink', 'accent-hover': 'on-accent', 'quiet-hover': 'quiet-text', 'ready-bg': 'accent', 'skip-bg': 'skip-text', 'pending-bg': 'pending-text', 'notice-bg': 'notice-text', 'error-bg': 'error-text' };
   for (const [background, texts] of Object.entries(pairs)) for (const text of texts.split(' ')) assert.ok(ratio(light[text], light[background]) >= 4.5, `${text} on ${background}`);
+});
+test('dark secondary text and field borders meet contrast minimums', async () => {
+  const css = await readFile('src/style.css', 'utf8');
+  const palette = (pattern) => Object.fromEntries([...css.match(pattern)[1].matchAll(/--([\w-]+):(#[0-9a-f]{6})(?![0-9a-f])/gi)].map(([, name, value]) => [name, value]));
+  const dark = palette(/:root\{([^}]*)\}/);
+  const light = palette(/:root\[data-theme=light\]\{([^}]*)\}/);
+  const luminance = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+  const ratio = (a, b) => { const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (high + 0.05) / (low + 0.05); };
+  for (const surface of ['bg', 'panel', 'detail-bg', 'quote-bg']) assert.ok(ratio(dark.dim, dark[surface]) >= 4.5, `dim on ${surface}`);
+  assert.ok(ratio(dark['field-line'], dark.panel) >= 3, 'dark field border');
+  assert.ok(ratio(light['field-line'], light.panel) >= 3, 'light field border on panel');
+  assert.ok(ratio(light['field-line'], light.bg) >= 3, 'light field border on page');
+});
+test('journal refresh keeps focus targets and does not hide the tab panel ring', async () => {
+  const [src, css] = await Promise.all(['src/main.ts', 'src/style.css'].map((path) => readFile(path, 'utf8')));
+  assert.match(src, /dataset\.ticketId/);
+  assert.match(src, /panelId, ticketId/);
+  assert.match(src, /\$\{tickets\.length\} \$\{tickets\.length === 1 \? 'ticket' : 'tickets'\}`, 'sr-only'/);
+  assert.doesNotMatch(src, /count\.setAttribute\('aria-label'/);
+  assert.match(src, /aria-orientation/);
+  assert.match(src, /prefers-reduced-motion/);
+  assert.match(src, /priceLabel\(selection\.odds\)/);
+  assert.match(src, /className = 'sr-only'| 'sr-only'/);
+  assert.doesNotMatch(css, /\.book-panel:focus-visible\{outline:\s*none\}/);
+  assert.match(css, /\.sr-only\{/);
 });
