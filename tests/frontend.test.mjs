@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 const source = await readFile('src/presentation.ts', 'utf8');
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
-const { money, safeSourceUrl, progress, calendarDate, age, americanOdds, priceLabel } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
+const { money, safeSourceUrl, progress, calendarDate, age, americanOdds, priceLabel, timestamp, formatMultiple } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
 test('leg prices show American odds for favorites, underdogs and invalid input', () => {
   assert.equal(americanOdds(1 / 0.96), '-2400'); assert.equal(americanOdds(1 + 100 / 174), '-174'); assert.equal(americanOdds(2.15), '+115');
   assert.equal(americanOdds(2), '+100'); assert.equal(americanOdds(1), 'Unpriced'); assert.equal(americanOdds(Number.NaN), 'Unpriced');
@@ -138,6 +138,38 @@ test('dark secondary text and field borders meet contrast minimums', async () =>
   assert.ok(ratio(light['field-line'], light.panel) >= 3, 'light field border on panel');
   assert.ok(ratio(light['field-line'], light.bg) >= 3, 'light field border on page');
 });
+test('timestamps name the year only outside the current Central year, and sync age uses words', () => {
+  const now = new Date('2026-10-13T18:00:00Z');
+  const current = timestamp('2026-10-13T18:00:00Z', now);
+  assert.match(current, /Oct 13/);
+  assert.doesNotMatch(current, /2026/);
+  const older = timestamp('2024-03-01T18:00:00Z', now);
+  assert.match(older, /Mar 1/);
+  assert.match(older, /2024/);
+  assert.equal(timestamp('not-a-date', now), 'Not confirmed');
+  assert.equal(age(null), 'Awaiting first sync');
+  assert.equal(age('not-a-date'), 'Not confirmed');
+  const instant = now.getTime();
+  assert.equal(age(new Date(instant - 60_000).toISOString(), instant), 'Updated 1 minute ago');
+  assert.equal(age(new Date(instant - 5 * 60_000).toISOString(), instant), 'Updated 5 minutes ago');
+  assert.equal(age(new Date(instant - 60 * 60_000).toISOString(), instant), 'Updated 1 hour ago');
+  assert.equal(age(new Date(instant - 2 * 24 * 60 * 60_000).toISOString(), instant), 'Updated 2 days ago');
+  const centralEvening = new Date('2026-01-01T05:00:00Z');
+  const sameCentralYear = timestamp('2026-01-01T04:00:00Z', centralEvening);
+  assert.match(sameCentralYear, /Dec 31/);
+  assert.doesNotMatch(sameCentralYear, /2025|2026/);
+  const previousCentralYear = timestamp('2026-01-01T05:30:00Z', new Date('2026-06-15T18:00:00Z'));
+  assert.match(previousCentralYear, /Dec 31/);
+  assert.match(previousCentralYear, /2025/);
+});
+test('non-finite odds do not render as NaN', () => {
+  assert.equal(formatMultiple(null, 2, 'Unconfirmed'), 'Unconfirmed');
+  assert.equal(formatMultiple(Number.NaN, 2, 'Unconfirmed'), 'Unpriced');
+  assert.equal(formatMultiple(Number.POSITIVE_INFINITY, 3, 'Not recorded'), 'Unpriced');
+  assert.equal(formatMultiple(2.5, 2, 'Unconfirmed'), '2.50×');
+  assert.equal(formatMultiple(1.21, 3, 'Not recorded'), '1.210×');
+  assert.equal(formatMultiple(undefined, 2, 'Not recorded'), 'Not recorded');
+});
 test('journal refresh keeps focus targets and does not hide the tab panel ring', async () => {
   const [src, css] = await Promise.all(['src/main.ts', 'src/style.css'].map((path) => readFile(path, 'utf8')));
   assert.match(src, /dataset\.ticketId/);
@@ -150,4 +182,43 @@ test('journal refresh keeps focus targets and does not hide the tab panel ring',
   assert.match(src, /className = 'sr-only'| 'sr-only'/);
   assert.doesNotMatch(css, /\.book-panel:focus-visible\{outline:\s*none\}/);
   assert.match(css, /\.sr-only\{/);
+  assert.match(src, /activeBook !== id/);
+  assert.match(src, /Skip to journal/);
+  assert.match(src, /Hide details/);
+  assert.match(src, /net !== null && net >= 0/);
+  assert.doesNotMatch(src, /feesCents \?\? 0/);
+  assert.match(src, /event\.shiftKey/);
+  assert.match(src, /empty-title/);
+  assert.match(css, /touch-action:pan-y pinch-zoom/);
+  assert.match(css, /max-height:760px/);
+  assert.doesNotMatch(css, /\.ticket-amounts\{[^}]*white-space:nowrap/);
+  assert.match(css, /\.ticket-net\{[^}]*font-size:12px/);
+  assert.match(css, /color-mix\(in srgb,var\(--positive\) 6%/);
+  assert.match(css, /color-mix\(in srgb,currentColor 8%/);
+});
+test('ticket wash, link underlines, and the goal track keep their contrast jobs', async () => {
+  const css = await readFile('src/style.css', 'utf8');
+  const palette = (pattern) => Object.fromEntries([...css.match(pattern)[1].matchAll(/--([\w-]+):(#[0-9a-f]{6})(?![0-9a-f])/gi)].map(([, name, value]) => [name, value]));
+  const dark = palette(/:root\{([^}]*)\}/);
+  const light = palette(/:root\[data-theme=light\]\{([^}]*)\}/);
+  const luminance = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+  const ratio = (a, b) => { const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x); return (high + 0.05) / (low + 0.05); };
+  const mix = (fg, bg, amount) => `#${[0, 2, 4].map((i) => Math.round(parseInt(fg.slice(i + 1, i + 3), 16) * amount + parseInt(bg.slice(i + 1, i + 3), 16) * (1 - amount)).toString(16).padStart(2, '0')).join('')}`;
+  const wash = Number(css.match(/\.ticket-row-won\{background:color-mix\(in srgb,var\(--positive\) ([\d.]+)%/)[1]) / 100;
+  const pill = Number(css.match(/\.ticket-status\{[^}]*color-mix\(in srgb,currentColor ([\d.]+)%/)[1]) / 100;
+  for (const [name, colors] of [['dark', dark], ['light', light]]) {
+    assert.ok(ratio(colors['link-line'], colors['detail-bg']) >= 3, `${name} link underline`);
+    assert.ok(ratio(colors['lock-ring'], colors.bg) >= 3, `${name} lock ring`);
+    assert.ok(ratio(colors.accent, colors['goal-track']) >= 3, `${name} goal fill on track`);
+    const tones = [['positive', colors.positive], ['negative', colors.negative], ['pending-text', colors['pending-text']], ['muted', colors.muted]];
+    for (const [tone, ink] of tones) {
+      const row = mix(ink, colors['detail-bg'], wash);
+      assert.ok(ratio(colors.dim, row) >= 4.5, `${name} dim on ${tone} row`);
+      const chip = mix(tone === 'muted' ? colors['ticket-status'] : ink, row, pill);
+      const chipInk = tone === 'muted' ? colors['ticket-status'] : ink;
+      assert.ok(ratio(chipInk, chip) >= 4.5, `${name} status on ${tone} chip`);
+    }
+  }
+  assert.ok(ratio(dark['goal-track'], dark.panel) >= 2.4, 'dark goal track');
+  assert.ok(ratio(light['goal-track'], light.panel) >= 1.8, 'light goal track');
 });

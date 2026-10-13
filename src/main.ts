@@ -1,6 +1,6 @@
 import './style.css';
 import type { BookState, Card, Selection, Ticket, TrackState } from '../shared/types';
-import { age, calendarDate, money, priceLabel, progress, safeSourceUrl, signedMoney, timestamp } from './presentation';
+import { age, calendarDate, formatMultiple, money, priceLabel, progress, safeSourceUrl, signedMoney, timestamp } from './presentation';
 import { initTheme, themeToggle } from './theme';
 
 type Child = Node | string | null | undefined;
@@ -48,6 +48,30 @@ function footer() {
   return el('footer', 'site-footer', text('span', 'All times Central · USD'));
 }
 
+function skipLink(href: string, label: string, focus?: () => void) {
+  const link = el('a', 'skip-link', label);
+  link.id = 'skip';
+  link.href = href;
+  if (focus) link.addEventListener('click', (event) => {
+    event.preventDefault();
+    focus();
+  });
+  return link;
+}
+
+function focusJournalLanding() {
+  const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  const land = (node: HTMLElement | null) => {
+    if (!node) return false;
+    node.focus({ preventScroll: true });
+    node.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: motion });
+    return true;
+  };
+  if (land(document.querySelector<HTMLElement>('.book-tab[aria-selected="true"]'))) return;
+  if (land(document.getElementById('empty-title'))) return;
+  document.getElementById('journal-title')?.focus({ preventScroll: true });
+}
+
 function banner(message: string, tone = 'warning', live = false) {
   const element = el('div', `notice notice-${tone}`, message);
   if (live) element.setAttribute('role', tone === 'error' ? 'alert' : 'status');
@@ -60,20 +84,43 @@ function decorativeArrow(className = '') {
   return arrow;
 }
 
-type ViewSnapshot = { openTickets: { panelId: string; ticketId: string }[]; tabsScroll: number; pageScroll: number; focus: string | null };
+type FocusTarget =
+  | { type: 'id'; id: string }
+  | { type: 'ticket'; panelId: string; ticketId: string }
+  | { type: 'source'; panelId: string; href: string };
 
-function focusSelector(node: Element | null): string | null {
+type ViewSnapshot = { openTickets: { panelId: string; ticketId: string }[]; tabsScroll: number; pageScroll: number; focus: FocusTarget | null };
+
+function focusTarget(node: Element | null): FocusTarget | null {
   if (!(node instanceof HTMLElement) || !root.contains(node)) return null;
-  if (node.id) return `#${CSS.escape(node.id)}`;
   const panel = node.closest('.book-panel');
-  const panelId = panel instanceof HTMLElement && panel.id ? `#${CSS.escape(panel.id)} ` : '';
+  const panelId = panel instanceof HTMLElement ? panel.id : '';
   const details = node.closest('details.ticket');
-  if (details instanceof HTMLDetailsElement && details.dataset.ticketId && (node.tagName === 'SUMMARY' || node === details)) {
-    return `${panelId}details.ticket[data-ticket-id="${CSS.escape(details.dataset.ticketId)}"] > summary`;
+  if (details instanceof HTMLDetailsElement && details.dataset.ticketId && panelId && (node.closest('summary') || node === details)) {
+    return { type: 'ticket', panelId, ticketId: details.dataset.ticketId };
   }
-  if (node instanceof HTMLAnchorElement && node.classList.contains('source-link')) {
+  if (node instanceof HTMLAnchorElement && node.classList.contains('source-link') && panelId) {
     const href = node.getAttribute('href');
-    if (href) return `${panelId}a.source-link[href="${CSS.escape(href)}"]`;
+    if (href) return { type: 'source', panelId, href };
+  }
+  if (node.id) return { type: 'id', id: node.id };
+  return null;
+}
+
+function resolveFocus(target: FocusTarget): HTMLElement | null {
+  if (target.type === 'id') return document.getElementById(target.id);
+  const panel = document.getElementById(target.panelId);
+  if (!panel) return null;
+  if (target.type === 'ticket') {
+    for (const details of panel.querySelectorAll<HTMLDetailsElement>('details.ticket')) {
+      if (details.dataset.ticketId !== target.ticketId) continue;
+      const summary = details.querySelector('summary');
+      return summary instanceof HTMLElement ? summary : null;
+    }
+    return null;
+  }
+  for (const link of panel.querySelectorAll<HTMLAnchorElement>('a.source-link')) {
+    if (link.getAttribute('href') === target.href) return link;
   }
   return null;
 }
@@ -89,25 +136,33 @@ function captureView(): ViewSnapshot {
     }),
     tabsScroll: document.querySelector<HTMLElement>('.book-tabs')?.scrollLeft ?? 0,
     pageScroll: window.scrollY,
-    focus: focusSelector(document.activeElement),
+    focus: focusTarget(document.activeElement),
   };
 }
 
-function restoreView(view: ViewSnapshot) {
+function syncTicketExpand(details: HTMLDetailsElement) {
+  const expand = details.querySelector('.ticket-expand');
+  if (expand) expand.textContent = details.open ? 'Hide details' : 'View details';
+}
+
+function restoreView(view: ViewSnapshot, restoreFocus = true) {
   for (const { panelId, ticketId } of view.openTickets) {
     const panel = document.getElementById(panelId);
     if (!panel) continue;
-    try {
-      const details = panel.querySelector(`details.ticket[data-ticket-id="${CSS.escape(ticketId)}"]`);
-      if (details instanceof HTMLDetailsElement) details.open = true;
-    } catch { /* The ticket id cannot be selected. */ }
+    for (const details of panel.querySelectorAll<HTMLDetailsElement>('details.ticket')) {
+      if (details.dataset.ticketId !== ticketId) continue;
+      details.open = true;
+      syncTicketExpand(details);
+      break;
+    }
   }
   const tabs = document.querySelector<HTMLElement>('.book-tabs');
-  if (tabs) tabs.scrollLeft = view.tabsScroll;
-  if (view.focus) {
-    try { document.querySelector<HTMLElement>(view.focus)?.focus({ preventScroll: true }); } catch { /* The previous control is gone. */ }
+  if (tabs && Math.abs(tabs.scrollLeft - view.tabsScroll) > 1) tabs.scrollLeft = view.tabsScroll;
+  if (restoreFocus && view.focus) {
+    const next = resolveFocus(view.focus);
+    if (next && next !== document.activeElement) next.focus({ preventScroll: true });
   }
-  window.scrollTo({ top: view.pageScroll, left: 0, behavior: 'auto' });
+  if (Math.abs(window.scrollY - view.pageScroll) > 1) window.scrollTo({ top: view.pageScroll, left: 0, behavior: 'auto' });
 }
 
 function setLock(message = '', focus = false) {
@@ -171,6 +226,8 @@ function renderLock(focus = false) {
       expiryTimer = setTimeout(() => setLock('Your session expired. Enter your code to reopen the journal.', true), Math.min(expiry - Date.now(), 2_147_483_647));
       renderJournal();
       await refresh();
+      const active = document.activeElement;
+      if (session && (active === document.body || active === null || !root.contains(active))) focusJournalLanding();
     } catch (error) {
       input.value = '';
       if (session) return;
@@ -191,7 +248,7 @@ function renderLock(focus = false) {
   const panel = el('section', 'unlock-panel', lockIcon, title, description, form, text('p', 'Records stay locked until you open them.', 'privacy-note'));
   const main = el('main', 'lock-main', panel);
   main.setAttribute('aria-labelledby', 'lock-title');
-  root.replaceChildren(el('div', 'site-shell lock-shell', header, main, footer()));
+  root.replaceChildren(skipLink('#pin', 'Skip to access code', () => input.focus()), el('div', 'site-shell lock-shell', header, main, footer()));
   if (focus) input.focus();
 }
 
@@ -279,7 +336,16 @@ function updateSyncAge() {
   if (ageNode) ageNode.textContent = age(state?.updatedAt);
 }
 
-function renderJournal() {
+function emptyState(title: string, message: string, live = false) {
+  const heading = text('h2', title);
+  heading.id = 'empty-title';
+  heading.tabIndex = -1;
+  const panel = el('section', 'empty-panel', heading, text('p', message, 'muted'));
+  if (live) panel.setAttribute('role', 'status');
+  return panel;
+}
+
+function renderJournal(restoreFocus = true) {
   if (!session) return;
   const view = captureView();
   document.title = 'Track · Your journal';
@@ -292,14 +358,15 @@ function renderJournal() {
   const header = el('header', 'site-header', brand(), el('div', 'header-actions', refreshButton, lockButton, themeToggle()));
   const heading = text('h1', 'Your journal', 'sr-only');
   heading.id = 'journal-title';
+  heading.tabIndex = -1;
   const main = el('main', 'journal-main', heading, el('div', 'sync-line', text('span', age(state?.updatedAt), 'sync-age'), text('small', state?.updatedAt ? timestamp(state.updatedAt) : 'Not synced', 'muted')));
   main.setAttribute('aria-labelledby', 'journal-title');
   if (!state) main.setAttribute('aria-busy', 'true');
   if (refreshError) main.append(banner(refreshError, 'error', refreshError !== announcedError));
   if (!state) {
-    main.append(el('section', 'empty-panel', text('h2', refreshError ? 'Could not load' : 'Loading'), text('p', refreshError ? 'Use Refresh to try again.' : 'Loading balances and tickets.', 'muted')));
+    main.append(emptyState(refreshError ? 'Could not load' : 'Loading', refreshError ? 'Use Refresh to try again.' : 'Loading balances and tickets.', !refreshError));
   } else if (state.books.length === 0) {
-    main.append(el('section', 'empty-panel', text('h2', 'No books'), text('p', 'No balances yet.', 'muted')));
+    main.append(emptyState('No books', 'No balances yet.'));
   } else {
     const bookRank = (id: string) => { const index = bookOrder.indexOf(id); return index === -1 ? bookOrder.length : index; };
     const books = [...state.books].sort((a, b) => bookRank(a.id) - bookRank(b.id));
@@ -316,9 +383,12 @@ function renderJournal() {
       tab.setAttribute('aria-controls', `panel-${book.id}`);
       tab.tabIndex = book.id === activeBook ? 0 : -1;
       tab.addEventListener('keydown', (event) => {
+        if (event.altKey || event.ctrlKey || event.metaKey) return;
+        const arrow = event.key === 'ArrowRight' || event.key === 'ArrowDown' || event.key === 'ArrowLeft' || event.key === 'ArrowUp';
+        if (arrow && event.shiftKey) return;
         let next = index;
-        if (event.key === 'ArrowRight') next = (index + 1) % books.length;
-        else if (event.key === 'ArrowLeft') next = (index - 1 + books.length) % books.length;
+        if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % books.length;
+        else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + books.length) % books.length;
         else if (event.key === 'Home') next = 0;
         else if (event.key === 'End') next = books.length - 1;
         else return;
@@ -336,17 +406,19 @@ function renderJournal() {
       main.append(panel);
     }
   }
-  root.replaceChildren(el('div', 'site-shell', header, main, footer()));
+  root.replaceChildren(skipLink('#journal-title', 'Skip to journal', focusJournalLanding), el('div', 'site-shell', header, main, footer()));
   announcedError = refreshError;
-  restoreView(view);
+  restoreView(view, restoreFocus);
 }
 
 function selectBook(id: string) {
-  activeBook = id;
-  renderJournal();
+  const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  if (activeBook !== id) {
+    activeBook = id;
+    renderJournal(false);
+  }
   const tab = document.getElementById(`tab-${id}`);
   tab?.focus({ preventScroll: true });
-  const motion = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
   tab?.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: motion });
 }
 
@@ -358,19 +430,24 @@ function renderBook(book: BookState) {
   panel.tabIndex = 0;
   const playthroughCredit = book.playthrough === true;
   const equity = playthroughCredit ? book.tickets.reduce((sum, ticket) => sum + (ticket.status === 'void' ? 0 : ticket.stakeCents), 0) : book.availableCents;
-  const pct = progress(equity, 0, book.targetCents);
+  const hasGoal = Number.isFinite(book.targetCents) && book.targetCents > 0;
+  const pct = hasGoal ? progress(equity, 0, book.targetCents) : 0;
   const balance = el('section', 'balance-panel', el('div', 'balance-main', text('p', playthroughCredit ? 'Available credit' : 'Available', 'eyebrow'), text('p', money(book.availableCents), 'balance-value')));
   const metric = (label: string, value: string, tone = '') => el('div', `metric ${tone}`, text('p', label, 'metric-label'), text('p', value, 'metric-value'));
   balance.append(el('div', 'balance-metrics', metric('Outstanding', money(book.outstandingCents)), metric('Realized P&L', signedMoney(book.realizedProfitCents), book.realizedProfitCents > 0 ? 'positive' : book.realizedProfitCents < 0 ? 'negative' : ''), metric('Staked today', money(book.dailyStakedCents))));
-  const progressBar = el('div', 'goal-bar', el('span', 'goal-fill'));
-  (progressBar.firstElementChild as HTMLElement).style.width = `${pct}%`;
-  progressBar.setAttribute('role', 'progressbar');
-  progressBar.setAttribute('aria-label', playthroughCredit ? 'Recorded credit usage' : 'Progress toward growth goal');
-  progressBar.setAttribute('aria-valuemin', '0');
-  progressBar.setAttribute('aria-valuemax', '100');
-  progressBar.setAttribute('aria-valuenow', pct.toFixed(1));
-  progressBar.setAttribute('aria-valuetext', `${money(equity)} ${playthroughCredit ? 'recorded usage' : 'available'} toward ${money(book.targetCents)}`);
-  const goal = el('div', 'goal-row', el('div', 'goal-copy', text('span', playthroughCredit ? 'Credit used' : 'Growth', 'metric-label'), text('span', `${money(equity)} / ${money(book.targetCents)}`, 'goal-amount')), progressBar);
+  const goal = el('div', `goal-row${hasGoal ? '' : ' goal-row-solo'}`, el('div', 'goal-copy', text('span', playthroughCredit ? 'Credit used' : 'Growth', 'metric-label'), text('span', hasGoal ? `${money(equity)} / ${money(book.targetCents)}` : money(equity), 'goal-amount')));
+  if (hasGoal) {
+    const fill = el('span', 'goal-fill');
+    fill.style.width = `${pct}%`;
+    const progressBar = el('div', 'goal-bar', fill);
+    progressBar.setAttribute('role', 'progressbar');
+    progressBar.setAttribute('aria-label', playthroughCredit ? 'Recorded credit usage' : 'Progress toward growth goal');
+    progressBar.setAttribute('aria-valuemin', '0');
+    progressBar.setAttribute('aria-valuemax', '100');
+    progressBar.setAttribute('aria-valuenow', pct.toFixed(1));
+    progressBar.setAttribute('aria-valuetext', `${money(equity)} ${playthroughCredit ? 'recorded usage' : 'available'} toward ${money(book.targetCents)}`);
+    goal.append(progressBar);
+  }
   if (playthroughCredit) goal.append(text('span', 'Withdrawal eligibility requires app confirmation.', 'goal-caption'));
   balance.append(goal);
   panel.append(balance);
@@ -404,13 +481,16 @@ function renderCard(card: Card | null) {
   }
   const detail = (label: string, value: string) => el('div', '', text('span', label, 'quote-label'), text('strong', value, 'quote-value'));
   if (planned) {
-    const estimate = card.decimalOdds === null ? null : Math.round(planned * card.decimalOdds);
-    section.append(el('div', 'quote-grid', detail('Planned stake', money(planned)), detail('Est. total return', estimate === null ? 'See app' : money(estimate)), detail('Est. profit', estimate === null ? 'See app' : signedMoney(estimate - planned)), detail('Est. multiple', card.decimalOdds === null ? 'See app' : `${card.decimalOdds.toFixed(2)}×`)));
+    const odds = card.decimalOdds;
+    const priced = odds !== null && Number.isFinite(odds);
+    const estimate = priced ? Math.round(planned * odds) : null;
+    section.append(el('div', 'quote-grid', detail('Planned stake', money(planned)), detail('Est. total return', estimate === null ? 'See app' : money(estimate)), detail('Est. profit', estimate === null ? 'See app' : signedMoney(estimate - planned)), detail('Est. multiple', formatMultiple(odds, 2, 'See app'))));
     section.append(text('p', 'Estimate. Check the current app price and eligibility before placing.', 'fine-print plan-note'));
   }
   if (card.status === 'ready') {
-    section.append(el('div', 'quote-grid', detail('Proposed stake', money(card.proposedStakeCents)), detail('Total return', card.returnCents === null ? 'Unconfirmed' : money(card.returnCents)), detail('Potential profit', card.profitCents === null ? 'Unconfirmed' : signedMoney(card.profitCents)), detail('Return multiple', card.decimalOdds === null ? 'Unconfirmed' : `${card.decimalOdds.toFixed(2)}×`)));
-    section.append(text('p', `Fees ${money(card.feesCents ?? 0)}. Proposed, not placed.`, 'fine-print'));
+    section.append(el('div', 'quote-grid', detail('Proposed stake', money(card.proposedStakeCents)), detail('Total return', card.returnCents === null ? 'Unconfirmed' : money(card.returnCents)), detail('Potential profit', card.profitCents === null ? 'Unconfirmed' : signedMoney(card.profitCents)), detail('Return multiple', formatMultiple(card.decimalOdds, 2, 'Unconfirmed'))));
+    const feeNote = typeof card.feesCents === 'number' && Number.isFinite(card.feesCents) ? `Fees ${money(card.feesCents)}. ` : '';
+    section.append(text('p', `${feeNote}Proposed, not placed.`, 'fine-print'));
   }
   if (card.invalidations.length) {
     const list = el('ul', 'invalidation-list');
@@ -455,7 +535,9 @@ function renderHistory(tickets: Ticket[]) {
     const statusLabels = { open: 'Open', result_pending: 'Pending', won: 'Won', lost: 'Lost', void: 'Void', cashed_out: 'Cashed' };
     const settled = ['won', 'lost', 'void', 'cashed_out'].includes(ticket.status);
     const net = settled && ticket.returnCents !== null ? ticket.returnCents - ticket.stakeCents - ticket.feesCents : null;
-    const tone = ticket.status === 'won' || (ticket.status === 'cashed_out' && (net ?? 0) >= 0) ? 'won' : ticket.status === 'lost' || ticket.status === 'cashed_out' ? 'lost' : ticket.status;
+    const cashedEven = ticket.status === 'cashed_out' && net !== null && net >= 0;
+    const cashedDown = ticket.status === 'cashed_out' && net !== null && net < 0;
+    const tone = ticket.status === 'won' || cashedEven ? 'won' : ticket.status === 'lost' || cashedDown ? 'lost' : ticket.status;
     const details = el('details', `ticket ticket-row-${tone}`);
     details.dataset.ticketId = ticket.id;
     const title = ticket.selections.length === 1 ? ticket.selections[0].pick : `${ticket.selections.length} selections`;
@@ -470,13 +552,14 @@ function renderHistory(tickets: Ticket[]) {
     const fact = (label: string, value: string) => rows.append(el('div', '', el('dt', '', label), el('dd', '', value)));
     fact('Stake', money(ticket.stakeCents));
     fact('Fees', money(ticket.feesCents));
-    fact('Accepted multiple', ticket.decimalOdds === null ? 'Not recorded' : `${ticket.decimalOdds.toFixed(3)}×`);
+    fact('Accepted multiple', formatMultiple(ticket.decimalOdds, 3, 'Not recorded'));
     if (ticket.returnCents !== null) fact(ticket.status === 'result_pending' ? 'Calculated return' : 'Confirmed return', money(ticket.returnCents));
     if (ticket.settledAt) fact('Settled', timestamp(ticket.settledAt));
     if (['won', 'lost', 'void', 'cashed_out'].includes(ticket.status) && ticket.returnCents !== null) fact('Net result', signedMoney(ticket.returnCents - ticket.stakeCents - ticket.feesCents));
     ticketBody.append(rows);
     if (ticket.resultNote) ticketBody.append(text('p', ticket.resultNote, 'result-note'));
     ticketBody.append(text('small', `Ref ${ticket.id}`, 'ticket-id'));
+    details.addEventListener('toggle', () => syncTicketExpand(details));
     details.append(summary, ticketBody);
     list.append(details);
   });

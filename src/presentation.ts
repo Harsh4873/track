@@ -5,6 +5,11 @@ const dateTime = new Intl.DateTimeFormat('en-US', {
   timeZone: CENTRAL_TIME_ZONE,
   month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
 });
+const dateTimeWithYear = new Intl.DateTimeFormat('en-US', {
+  timeZone: CENTRAL_TIME_ZONE,
+  month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+});
+const yearOnly = new Intl.DateTimeFormat('en-US', { timeZone: CENTRAL_TIME_ZONE, year: 'numeric' });
 const shortDate = new Intl.DateTimeFormat('en-US', {
   timeZone: CENTRAL_TIME_ZONE, month: 'long', day: 'numeric', year: 'numeric',
 });
@@ -17,10 +22,11 @@ export function signedMoney(cents: number): string {
   return `${cents > 0 ? '+' : ''}${money(cents)}`;
 }
 
-export function timestamp(value: string | null | undefined): string {
+export function timestamp(value: string | null | undefined, now = new Date()): string {
   if (!value) return 'Not confirmed';
   const date = new Date(value);
-  return Number.isFinite(date.getTime()) ? dateTime.format(date) : 'Not confirmed';
+  if (!Number.isFinite(date.getTime())) return 'Not confirmed';
+  return (yearOnly.format(date) === yearOnly.format(now) ? dateTime : dateTimeWithYear).format(date);
 }
 
 export function calendarDate(value: string | null | undefined): string {
@@ -31,13 +37,15 @@ export function calendarDate(value: string | null | undefined): string {
 }
 
 export function age(value: string | null | undefined, now = Date.now()): string {
-  const time = value ? new Date(value).getTime() : NaN;
-  if (!Number.isFinite(time)) return 'Awaiting first sync';
+  if (!value) return 'Awaiting first sync';
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return 'Not confirmed';
   const minutes = Math.max(0, Math.floor((now - time) / 60_000));
   if (minutes < 1) return 'Updated just now';
-  if (minutes < 60) return `Updated ${minutes}m ago`;
-  if (minutes < 1440) return `Updated ${Math.floor(minutes / 60)}h ago`;
-  return `Updated ${Math.floor(minutes / 1440)}d ago`;
+  const unit = (count: number, singular: string) => `Updated ${count} ${count === 1 ? singular : `${singular}s`} ago`;
+  if (minutes < 60) return unit(minutes, 'minute');
+  if (minutes < 1440) return unit(Math.floor(minutes / 60), 'hour');
+  return unit(Math.floor(minutes / 1440), 'day');
 }
 
 export function americanOdds(decimal: number): string {
@@ -50,6 +58,12 @@ export function priceLabel(odds: number | null): string {
   if (odds === null) return 'Price unconfirmed';
   if (!Number.isFinite(odds) || odds <= 1) return 'Unpriced';
   return `${americanOdds(odds)} · ${(100 / odds).toFixed(1)}% implied`;
+}
+
+export function formatMultiple(decimal: number | null | undefined, digits: number, missing: string): string {
+  if (decimal === null || decimal === undefined) return missing;
+  if (!Number.isFinite(decimal)) return 'Unpriced';
+  return `${decimal.toFixed(digits)}×`;
 }
 
 export function safeSourceUrl(value: string): string | null {
