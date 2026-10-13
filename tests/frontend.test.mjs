@@ -102,6 +102,15 @@ test('stylesheet keeps every color in matching dark and light palettes', async (
   for (const scheme of ['dark', 'light']) assert.match(html, new RegExp(`<meta name="theme-color" content="${bg[scheme]}" media="\\(prefers-color-scheme: ${scheme}\\)" />`));
   assert.match(html, /<meta name="color-scheme" content="dark light" \/>/); assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/);
 });
+test('settled tickets carry subtle won and lost row shading with a colored net', async () => {
+  const [main, css] = await Promise.all(['src/main.ts', 'src/style.css'].map((path) => readFile(path, 'utf8')));
+  assert.match(main, /ticket-row-\$\{tone\}/);
+  assert.match(main, /ticket-net/);
+  assert.match(css, /\.ticket-row-won\{background:color-mix\(in srgb,var\(--positive\)/);
+  assert.match(css, /\.ticket-row-lost\{background:color-mix\(in srgb,var\(--negative\)/);
+  assert.match(main, /skip: 'No bet'/);
+  assert.match(main, /research: 'Research'/);
+});
 test('light palette text meets WCAG AA contrast on its background', async () => {
   const css = await readFile('src/style.css', 'utf8');
   const light = Object.fromEntries([...css.match(/:root\[data-theme=light\]\{([^}]*)\}/)[1].matchAll(/--([\w-]+):(#[0-9a-f]{6})(?![0-9a-f])/gi)].map(([, name, value]) => [name, value]));

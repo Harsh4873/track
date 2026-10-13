@@ -286,8 +286,8 @@ function renderCard(card: Card | null) {
     return section;
   }
   const planned = card.status === 'research' && card.plannedStakeCents ? card.plannedStakeCents : null;
-  const labels = { ready: 'Proposed', skip: 'Skip', research: 'Check' };
-  const status = labels[card.status] || 'Check';
+  const labels = { ready: 'Proposed', skip: 'No bet', research: 'Research' };
+  const status = labels[card.status] || 'Research';
   section.append(sectionHeader('Card', calendarDate(card.date), text('span', status, `status-badge status-${card.status}`)));
   if (card.summary) section.append(text('p', card.summary, 'card-lead'));
   if (card.tier !== null) section.append(text('span', `Tier ${card.tier}`, 'tier-label'));
@@ -341,10 +341,14 @@ function renderHistory(tickets: Ticket[]) {
   const list = el('div', 'ticket-list');
   [...tickets].sort((a, b) => new Date(b.placedAt).getTime() - new Date(a.placedAt).getTime()).forEach((ticket) => {
     const statusLabels = { open: 'Open', result_pending: 'Pending', won: 'Won', lost: 'Lost', void: 'Void', cashed_out: 'Cashed' };
-    const details = el('details', 'ticket');
+    const settled = ['won', 'lost', 'void', 'cashed_out'].includes(ticket.status);
+    const net = settled && ticket.returnCents !== null ? ticket.returnCents - ticket.stakeCents - ticket.feesCents : null;
+    const tone = ticket.status === 'won' || (ticket.status === 'cashed_out' && (net ?? 0) >= 0) ? 'won' : ticket.status === 'lost' || ticket.status === 'cashed_out' ? 'lost' : ticket.status;
+    const details = el('details', `ticket ticket-row-${tone}`);
     const title = ticket.selections.length === 1 ? ticket.selections[0].pick : `${ticket.selections.length} selections`;
     const total = ticket.status === 'open' || ticket.status === 'result_pending' ? `${money(ticket.stakeCents)} staked` : ticket.returnCents === null ? 'Return unconfirmed' : `${money(ticket.returnCents)} returned`;
-    const summary = el('summary', 'ticket-summary', el('div', 'ticket-summary-top', text('span', statusLabels[ticket.status] || 'Pending', `ticket-status ticket-${ticket.status}`), text('span', timestamp(ticket.placedAt), 'ticket-date')), el('div', 'ticket-summary-bottom', text('strong', title), text('span', total, 'ticket-total')), text('span', 'View details', 'ticket-expand'));
+    const amounts = el('span', 'ticket-amounts', text('span', total, 'ticket-total'), net === null ? null : text('span', signedMoney(net), `ticket-net ${net > 0 ? 'net-positive' : net < 0 ? 'net-negative' : ''}`));
+    const summary = el('summary', 'ticket-summary', el('div', 'ticket-summary-top', text('span', statusLabels[ticket.status] || 'Pending', `ticket-status ticket-${ticket.status}`), text('span', timestamp(ticket.placedAt), 'ticket-date')), el('div', 'ticket-summary-bottom', text('strong', title), amounts), text('span', 'View details', 'ticket-expand'));
     const ticketBody = el('div', 'ticket-body');
     const selections = el('ol', 'selections ticket-selections');
     ticket.selections.forEach((selection, index) => selections.append(renderSelection(selection, index)));
@@ -359,7 +363,7 @@ function renderHistory(tickets: Ticket[]) {
     if (['won', 'lost', 'void', 'cashed_out'].includes(ticket.status) && ticket.returnCents !== null) fact('Net result', signedMoney(ticket.returnCents - ticket.stakeCents - ticket.feesCents));
     ticketBody.append(rows);
     if (ticket.resultNote) ticketBody.append(text('p', ticket.resultNote, 'result-note'));
-    ticketBody.append(text('small', `Ticket ${ticket.id}`, 'ticket-id'));
+    ticketBody.append(text('small', `Ref ${ticket.id}`, 'ticket-id'));
     details.append(summary, ticketBody);
     list.append(details);
   });
