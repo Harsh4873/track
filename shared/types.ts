@@ -74,6 +74,8 @@ export interface BookState {
   card: Card | null;
   /** True when this balance is playthrough credit. */
   playthrough?: boolean;
+  /** True when desk proposals are halted for this book. Confirmed slips still record. */
+  halted?: boolean;
   retired?: boolean;
   lastBalanceReport?: {
     reportedAt: string;
@@ -105,6 +107,12 @@ export interface BookPolicy {
   quoteMaxAgeMinutes: number;
   /** Wagering requirement. Available cash may sit at the target without freezing confirmed placement. */
   playthrough?: boolean;
+  /** Desk proposals (ready/planned cards) are rejected while true. Confirmed slips still record. */
+  halted?: boolean;
+  /** Proposal stakes may not push available below this floor. */
+  reserveFloorCents?: number;
+  /** Proposal limit on simultaneously open tickets for this book. */
+  maxOpenTickets?: number;
 }
 
 export interface BootstrapRequest {
@@ -130,6 +138,7 @@ export type LedgerEvent = EventBase & (
   | { type: 'balance_report'; availableCents: number; previousAvailableCents: number; establishDayBaseline?: boolean }
   | { type: 'retire_book' }
   | { type: 'open_book'; name: string; openingCents: number; targetCents: number; policy: BookPolicy }
+  | { type: 'update_policy'; policy: BookPolicy }
   | { type: 'correct_settlement'; appSettlementConfirmed: true; ticketId: string; outcome: 'won' | 'lost' | 'void' | 'cashed_out'; returnCents: number; settlementFeeCents: number; relatedEventId: string }
   | {
     type: 'correct_place';

@@ -370,6 +370,80 @@ test('cards accept the active books including novig credit', () => {
   const cards = ['polymarket', 'fliff', 'rebet', 'novig', 'underdog', 'underdog_streaks', 'novig_credit'].map((book) => ({ book, card }));
   assert.equal(parseCards({ idempotencyKey: 'cards.seven', cards }).cards.length, 7);
 });
+function fixturePolicy(book: BookId, overrides: Record<string, unknown> = {}) {
+  return { ...initial().books.find((entry) => entry.id === book)!.policy, ...overrides };
+}
+function policyEvent(book: BookId, overrides: Record<string, unknown> = {}, k = `policy.${book}`) {
+  return { idempotencyKey: k, type: 'update_policy', book, occurredAt: iso, note: 'Guardrail policy update', policy: fixturePolicy(book, overrides) };
+}
+function plannedCard(stakeCents = 1000, picks: [string, string] = ['Home', 'Away']): Card {
+  return { ...ready(), status: 'research', proposedStakeCents: 0, returnCents: null, profitCents: null, plannedStakeCents: stakeCents, selections: [selection(picks[0]), selection(picks[1])] };
+}
+function skipCard(): Card {
+  return { date: '2026-06-10', status: 'skip', summary: 'No bet', updatedAt: iso, tier: null, proposedStakeCents: 0, decimalOdds: null, returnCents: null, profitCents: null, selections: [], sources: [], invalidations: ['No bet'] };
+}
+test('update_policy changes caps while preserving balances, day spend and tickets; old payloads still parse', () => {
+  assert.doesNotThrow(() => parseBootstrap(initial()));
+  assert.doesNotThrow(() => parseEvent(policyEvent('rebet')));
+  let l = applyEvent(ledger(), parseEvent(placed()), now);
+  const before = structuredClone(b(l));
+  l = applyEvent(l, parseEvent(policyEvent('rebet', { dailyCapCents: 123, maxOpenTickets: 1 })), now);
+  const after = b(l);
+  assert.equal(after.policy.dailyCapCents, 123); assert.equal(after.policy.maxOpenTickets, 1);
+  assert.equal(after.availableCents, before.availableCents); assert.equal(after.outstandingCents, before.outstandingCents);
+  assert.deepEqual(after.day, before.day); assert.deepEqual(after.tickets, before.tickets);
+});
+test('halted books reject ready and planned cards, allow skip cards, and still record confirmed slips', () => {
+  let l = applyEvent(ledger(), parseEvent(policyEvent('rebet', { halted: true })), now);
+  assert.equal(visibleState(l, now).books.find((book) => book.id === 'rebet')!.halted, true);
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'halt.ready', cards: [{ book: 'rebet', card: ready() }] }), now), /book_halted/);
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'halt.plan', cards: [{ book: 'rebet', card: plannedCard() }] }), now), /book_halted/);
+  l = applyCards(l, parseCards({ idempotencyKey: 'halt.skip', cards: [{ book: 'rebet', card: skipCard() }] }), now);
+  assert.equal(b(l).card!.status, 'skip');
+  l = applyEvent(l, parseEvent(placed()), now);
+  assert.equal(b(l).availableCents, 9000); assert.equal(b(l).outstandingCents, 1000);
+});
+test('reserve floor blocks a stake that would breach it and allows one landing exactly on it', () => {
+  const l = applyEvent(ledger(), parseEvent(policyEvent('rebet', { reserveFloorCents: 9500 })), now);
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'floor.over', cards: [{ book: 'rebet', card: plannedCard(501) }] }), now), /daily_limit_exceeded/);
+  const ok = applyCards(l, parseCards({ idempotencyKey: 'floor.exact', cards: [{ book: 'rebet', card: plannedCard(500) }] }), now);
+  assert.equal(b(ok).card!.plannedStakeCents, 500); assert.equal(b(ok).availableCents, 10_000);
+});
+test('tier fractions cap ready stakes by tier', () => {
+  const over = ready(); over.tier = 2; over.proposedStakeCents = 6000; over.returnCents = 7260; over.profitCents = 1260;
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'tier2.over', cards: [{ book: 'rebet', card: over }] }), now), /daily_limit_exceeded/);
+  const exact = ready(); exact.tier = 2; exact.proposedStakeCents = 5000; exact.returnCents = 6050; exact.profitCents = 1050;
+  assert.equal(b(applyCards(ledger(), parseCards({ idempotencyKey: 'tier2.exact', cards: [{ book: 'rebet', card: exact }] }), now)).card!.proposedStakeCents, 5000);
+});
+test('a settled loss blocks proposals that day and the next Central day, then clears', () => {
+  let l = applyEvent(ledger(), parseEvent(placed()), now);
+  l = applyEvent(l, parseEvent(settle('lost', 0)), now);
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'cool.today', cards: [{ book: 'rebet', card: plannedCard() }] }), now), /loss_cooldown/);
+  const day1 = new Date('2026-06-11T15:00:00Z');
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'cool.next', cards: [{ book: 'rebet', card: { ...plannedCard(), date: '2026-06-11' } }] }), day1), /loss_cooldown/);
+  const day2 = new Date('2026-06-12T15:00:00Z');
+  const cleared = applyCards(l, parseCards({ idempotencyKey: 'cool.clear', cards: [{ book: 'rebet', card: { ...plannedCard(), date: '2026-06-12' } }] }), day2);
+  assert.equal(b(cleared).card!.plannedStakeCents, 1000);
+});
+test('maxOpenTickets blocks a second proposal while a ticket is open', () => {
+  let l = applyEvent(ledger(), parseEvent(policyEvent('rebet', { maxOpenTickets: 1 })), now);
+  l = applyEvent(l, parseEvent(placed()), now);
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'open.second', cards: [{ book: 'rebet', card: plannedCard(1000, ['Other', 'Elsewhere']) }] }), now), /too_many_open_tickets/);
+});
+test('a proposal reusing an event on an open ticket in another book is rejected', () => {
+  const l = applyEvent(ledger(), parseEvent(placed()), now);
+  const overlap = { ...plannedCard(200), decimalOdds: null, selections: [{ ...selection('Home'), event: ' Fixture HOME ' }, { ...selection('Away'), event: 'Another game' }] };
+  assert.throws(() => applyCards(l, parseCards({ idempotencyKey: 'dup.cross', cards: [{ book: 'underdog', card: overlap }] }), now), /duplicate_exposure/);
+  const first = plannedCard(200, ['First', 'Second']);
+  const second = { ...plannedCard(200), decimalOdds: null, selections: [{ ...selection('First'), event: 'fixture first' }, selection('Third')] };
+  assert.throws(() => applyCards(ledger(), parseCards({ idempotencyKey: 'dup.sibling', cards: [{ book: 'rebet', card: first }, { book: 'underdog', card: second }] }), now), /duplicate_exposure/);
+});
+test('update_policy fails on retired or unknown books', () => {
+  let l = applyEvent(ledger(), parseEvent({ idempotencyKey: 'retire.for.policy', type: 'retire_book', book: 'rebet', occurredAt: iso, note: 'Removed' }), now);
+  assert.throws(() => applyEvent(l, parseEvent(policyEvent('rebet', { halted: true })), now), /book_retired/);
+  const missing = ledger(); missing.books = missing.books.filter((book) => book.id !== 'underdog_streaks');
+  assert.throws(() => applyEvent(missing, parseEvent(policyEvent('underdog_streaks', { maxOpenTickets: 1 })), now), /book_not_found/);
+});
 test('Central calendar dates remain correct across DST transitions', () => {
   assert.equal(centralDay(new Date('2026-03-08T05:59:00Z')), '2026-03-07');
   assert.equal(centralDay(new Date('2026-03-08T08:01:00Z')), '2026-03-08');

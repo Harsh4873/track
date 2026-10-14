@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { ACTIVE_BOOK_IDS, BOOK_IDS, type BookId, type BookPolicy, type BookState, type BootstrapRequest, type Card, type ExchangeFill, type LedgerEvent, type PublishCardsRequest, type Selection, type Ticket, type TrackState } from '../../shared/types.js';
+import { ACTIVE_BOOK_IDS, BOOK_IDS, type BookId, type BookPolicy, type BookState, type BootstrapRequest, type Card, type ExchangeFill, type LedgerEvent, type PublishCardsRequest, type Selection, type Ticket, type Tier, type TrackState } from '../../shared/types.js';
 
 export class ApiError extends Error {
   constructor(public status: number, public code: string) { super(code); }
@@ -67,6 +67,9 @@ function validatePolicy(value: unknown, id: BookId): asserts value is BookPolicy
   ensure(value.minLegImpliedProbability === null || value.maxLegImpliedProbability === null || (value.minLegImpliedProbability as number) <= (value.maxLegImpliedProbability as number));
   number(value.quoteMaxAgeMinutes, 1, 120);
   if (value.playthrough !== undefined) ensure(typeof value.playthrough === 'boolean');
+  if (value.halted !== undefined) ensure(typeof value.halted === 'boolean');
+  if (value.reserveFloorCents !== undefined) integer(value.reserveFloorCents);
+  if (value.maxOpenTickets !== undefined) { integer(value.maxOpenTickets); ensure(value.maxOpenTickets <= 50); }
 }
 
 export function parseBootstrap(value: unknown): BootstrapRequest {
@@ -107,6 +110,9 @@ export function parseEvent(value: unknown): LedgerEvent {
       if (value.establishDayBaseline !== undefined) ensure(typeof value.establishDayBaseline === 'boolean');
       break;
     case 'retire_book':
+      break;
+    case 'update_policy':
+      validatePolicy(value.policy, value.book);
       break;
     case 'open_book':
       text(value.name, 60); integer(value.openingCents); integer(value.targetCents); ensure(value.targetCents > 0);
@@ -190,14 +196,15 @@ function rollDay(book: InternalBook, now: Date): void {
 }
 
 function stakeLimit(book: InternalBook): number {
-  return Math.max(0, Math.min(book.availableCents, Math.floor(book.day.bankrollCents * book.policy.maxBankrollFraction) - book.day.spentCents, (book.policy.dailyCapCents ?? MAX_CENTS) - book.day.spentCents));
+  return Math.max(0, Math.min(book.availableCents - (book.policy.reserveFloorCents ?? 0), Math.floor(book.day.bankrollCents * book.policy.maxBankrollFraction) - book.day.spentCents, (book.policy.dailyCapCents ?? MAX_CENTS) - book.day.spentCents));
 }
 
-function validateStake(book: InternalBook, stakeCents: number, feesCents: number, initial = true): void {
+function validateStake(book: InternalBook, stakeCents: number, feesCents: number, initial = true, cardTier?: Tier | null): void {
   const cost = stakeCents + feesCents;
   validateTargetStake(book, stakeCents);
   ensure(!initial || stakeCents >= book.policy.minStakeCents, 'below_minimum_stake');
   ensure(cost <= stakeLimit(book), 'daily_limit_exceeded', 409);
+  if (cardTier) ensure(cost <= Math.floor(book.day.bankrollCents * book.policy.tierFractions[cardTier - 1]) - book.day.spentCents, 'daily_limit_exceeded', 409);
   ensure(!initial || cost >= Math.ceil(book.day.bankrollCents * book.policy.minimumBankrollFraction), 'below_minimum_allocation');
 }
 
@@ -258,7 +265,7 @@ function validateReadyCard(book: InternalBook, card: Card, now: Date): void {
   if (book.id === 'polymarket') ensure(check.jurisdiction === 'US', 'us_contract_required');
   ensure(card.minimumStakeCents !== undefined && card.minimumStakeCents > 0 && card.proposedStakeCents >= card.minimumStakeCents, 'verified_minimum_stake_required');
   ensure(card.feesCents !== undefined, 'fees_required');
-  validateStake(book, card.proposedStakeCents, card.feesCents);
+  validateStake(book, card.proposedStakeCents, card.feesCents, true, card.tier);
   validateMarket(book, card.selections, card.decimalOdds);
   for (const selection of card.selections) {
     ensure(selection.quoteBasis !== 'comparison', 'comparison_quote_not_actionable');
@@ -275,6 +282,25 @@ function findTicket(book: InternalBook, id: string): Ticket {
   const ticket = book.tickets.find((item) => item.id === id); ensure(ticket, 'ticket_not_found', 404); return ticket;
 }
 function isOpen(ticket: Ticket): boolean { return ticket.status === 'open' || ticket.status === 'result_pending'; }
+
+function normalizedEvent(event: string): string { return event.trim().toLowerCase(); }
+function previousCentralDay(now: Date): string {
+  return new Date(Date.parse(`${centralDay(now)}T12:00:00.000Z`) - 86_400_000).toISOString().slice(0, 10);
+}
+
+// Desk-proposal guards only: confirmed slips record exactly and never pass through here.
+function validateProposalGuards(ledger: Ledger, book: InternalBook, card: Card, now: Date, siblingEvents: Set<string>): void {
+  ensure(!book.policy.halted, 'book_halted', 409);
+  if (book.policy.maxOpenTickets !== undefined) ensure(book.tickets.filter(isOpen).length < book.policy.maxOpenTickets, 'too_many_open_tickets', 409);
+  const cooldownDays = new Set([centralDay(now), previousCentralDay(now)]);
+  ensure(!book.tickets.some((ticket) => ticket.status === 'lost' && ticket.settledAt && cooldownDays.has(centralDay(new Date(ticket.settledAt)))), 'loss_cooldown', 409);
+  const openEvents = new Set<string>();
+  for (const other of ledger.books) { if (other.id === book.id) continue; for (const ticket of other.tickets) if (isOpen(ticket)) for (const selection of ticket.selections) openEvents.add(normalizedEvent(selection.event)); }
+  for (const selection of card.selections) {
+    const event = normalizedEvent(selection.event);
+    ensure(!openEvents.has(event) && !siblingEvents.has(event), 'duplicate_exposure', 409);
+  }
+}
 
 export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Ledger {
   const ledger = structuredClone(previous);
@@ -297,6 +323,11 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
     ensure(!book.tickets.some(isOpen), 'open_tickets', 409);
     ensure(book.outstandingCents === 0, 'outstanding_exposure', 409);
     book.retired = true; book.card = null; ledger.updatedAt = now.toISOString();
+    return ledger;
+  }
+  if (event.type === 'update_policy') {
+    ensure(!book.retired, 'book_retired', 409);
+    book.policy = event.policy; ledger.updatedAt = now.toISOString();
     return ledger;
   }
   ensure(!book.retired, 'book_retired', 409);
@@ -417,15 +448,19 @@ export function applyEvent(previous: Ledger, event: LedgerEvent, now: Date): Led
 
 export function applyCards(previous: Ledger, input: PublishCardsRequest, now: Date): Ledger {
   const ledger = structuredClone(previous);
+  const siblingEvents = new Set<string>();
   for (const entry of input.cards) {
     const book = ledger.books.find((item) => item.id === entry.book);
     ensure(book && !book.retired, book ? 'book_retired' : 'book_not_found', book ? 409 : 404); rollDay(book, now);
     ensure(entry.card.date === centralDay(now), 'card_day_mismatch');
+    const isProposal = entry.card.status === 'ready' || entry.card.plannedStakeCents !== undefined;
+    if (isProposal) validateProposalGuards(ledger, book, entry.card, now, siblingEvents);
     if (entry.card.status === 'ready') validateReadyCard(book, entry.card, now);
     if (entry.card.plannedStakeCents !== undefined) {
-      validateStake(book, entry.card.plannedStakeCents, entry.card.feesCents ?? 0);
+      validateStake(book, entry.card.plannedStakeCents, entry.card.feesCents ?? 0, true, entry.card.tier);
       validateMarket(book, entry.card.selections, entry.card.decimalOdds, false);
     }
+    if (isProposal) for (const selection of entry.card.selections) siblingEvents.add(normalizedEvent(selection.event));
     book.card = { ...entry.card, updatedAt: now.toISOString() };
   }
   ledger.updatedAt = now.toISOString(); return ledger;
@@ -436,6 +471,7 @@ export function visibleState(ledger: Ledger | null, now: Date): TrackState {
   return { updatedAt: ledger.updatedAt, ledgerStart: ledger.ledgerStart, books: ledger.books.filter((internal) => !internal.retired).map((internal) => {
     const { policy, day, budgets, retired, ...book } = structuredClone(internal); book.dailyStakedCents = day.date === centralDay(now) ? day.stakedCents : 0;
     if (policy.playthrough) book.playthrough = true;
+    if (policy.halted) book.halted = true;
     if (book.card?.status === 'ready') {
       const stale = book.card.date !== centralDay(now) || book.card.selections.some((selection) => Date.parse(selection.startTime) <= now.getTime() || now.getTime() - Date.parse(selection.quotedAt) > policy.quoteMaxAgeMinutes * 60_000);
       if (stale) book.card = { ...book.card, status: 'research', proposedStakeCents: 0, returnCents: null, profitCents: null, summary: `Recheck required. ${book.card.summary}` };
